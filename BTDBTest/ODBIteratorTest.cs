@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Assent;
+using BTDB;
 using BTDB.Buffer;
 using BTDB.Encrypted;
 using BTDB.FieldHandler;
@@ -342,6 +343,7 @@ public class ODBIteratorTest : IDisposable
         Item2
     }
 
+    [Generate]
     public class VariousFieldTypes
     {
         public string StringField { get; set; }
@@ -416,6 +418,7 @@ public class ODBIteratorTest : IDisposable
         }
     }
 
+    [Generate]
     public class VariousLists
     {
         public IList<int> IntList { get; set; }
@@ -438,6 +441,7 @@ public class ODBIteratorTest : IDisposable
         IterateWithApprove();
     }
 
+    [Generate]
     public class InlineDictionary
     {
         public Dictionary<int, string> Int2String { get; set; }
@@ -467,6 +471,7 @@ public class ODBIteratorTest : IDisposable
         public int Type { get; set; }
     }
 
+    [Generate]
     public class ObjectWfd1
     {
         public Rule1 A { get; set; }
@@ -474,6 +479,7 @@ public class ODBIteratorTest : IDisposable
         public Rule1 C { get; set; }
     }
 
+    [Generate]
     public class ObjectWfd2
     {
         public Rule2 A { get; set; }
@@ -770,5 +776,328 @@ public class ODBIteratorTest : IDisposable
         }
 
         IterateWithApprove();
+    }
+
+    public enum SimpleEnum
+    {
+        One = 1,
+        Two = 2
+    }
+
+    public enum SimpleEnumV2
+    {
+        Eins = 1,
+        Zwei = 2,
+    }
+
+    public class ItemWithEnumInKey
+    {
+        [PrimaryKey] public SimpleEnum Key { get; set; }
+    }
+
+    public class ItemWithEnumInKeyV2
+    {
+        [PrimaryKey] public SimpleEnumV2 Key { get; set; }
+    }
+
+    public interface ITableWithEnumInKey : IRelation<ItemWithEnumInKey>
+    {
+        void Insert(ItemWithEnumInKey person);
+    }
+
+    public interface ITableWithEnumInKeyV2 : IRelation<ItemWithEnumInKeyV2>
+    {
+        ItemWithEnumInKeyV2? FindById(SimpleEnumV2 key);
+    }
+
+    [Fact]
+    public void IterateUpgradedEnum()
+    {
+        using (var tr = _db.StartTransaction())
+        {
+            var creator = tr.InitRelation<ITableWithEnumInKey>("EnumWithItemInKey");
+            var table = creator(tr);
+
+            table.Insert(new ItemWithEnumInKey { Key = SimpleEnum.One });
+
+            tr.Commit();
+        }
+
+        ReopenDb();
+        using (var tr = _db.StartTransaction())
+        {
+            var creator = tr.InitRelation<ITableWithEnumInKeyV2>("EnumWithItemInKey");
+            var table = creator(tr);
+            // This will commit change in metadata, so iterate will print Eins instead of One
+            tr.Commit();
+        }
+
+        IterateWithApprove();
+    }
+
+    public class MetadataValue
+    {
+        public string StringValue { get; set; }
+        public bool IsReadOnly { get; set; }
+    }
+
+    public class MetadataContainer
+    {
+        public Dictionary<string, MetadataValue> Global { get; set; }
+        public Dictionary<ulong, Dictionary<string, MetadataValue>> Application { get; set; }
+    }
+
+    public class SimpleClaim
+    {
+        public string ClaimType { get; set; }
+        public string ClaimValue { get; set; }
+    }
+
+    public class UserLockout
+    {
+        public DateTime LockoutEndDate { get; set; }
+        public int AccessFailedCount { get; set; }
+    }
+
+    public class UserLockouts
+    {
+        public IDictionary<System.Net.IPAddress, UserLockout> ByRemoteIpAddress { get; set; }
+    }
+
+    public class IdentityUserkey2
+    {
+        public string Id { get; set; }
+        public string Name { get; set; }
+    }
+
+    public class RecordWithMetadata
+    {
+        [PrimaryKey(1)] public ulong CompanyId { get; set; }
+        [PrimaryKey(2)] public ulong ProviderId { get; set; }
+        [PrimaryKey(3)] public string UserId { get; set; }
+        public string UserName { get; set; }
+        public string NormalizedUserName { get; set; }
+        public string Email { get; set; }
+        public string NormalizedEmail { get; set; }
+        public bool EmailConfirmed { get; set; }
+        public string PasswordHash { get; set; }
+        public DateTime LastPasswordCreated { get; set; }
+        public DateTime CreatedDate { get; set; }
+        public IList<string> PasswordHashHistory { get; set; }
+        public string SecurityStamp { get; set; }
+        public string PhoneNumber { get; set; }
+        public UserLockouts Lockouts { get; set; }
+        public DateTime LockoutEnd { get; set; }
+        public int AccessFailedCount { get; set; }
+        public bool IsDisabled { get; set; }
+        public IList<SimpleClaim> Claims { get; set; }
+        public string GivenName { get; set; }
+        public string FamilyName { get; set; }
+        public string MiddleName { get; set; }
+        public string Language { get; set; }
+        public DateTime LastSuccessfulLogin { get; set; }
+        public List<IdentityUserkey2> UniqueKeys { get; set; }
+        public DateTime LastActivationEmailSent { get; set; }
+        public MetadataContainer Metadata { get; set; }
+    }
+
+    public interface IRecordWithMetadataRelation : IRelation<RecordWithMetadata>
+    {
+        void Insert(RecordWithMetadata value);
+    }
+
+    [Fact]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public void IterateRelationWithInlineDictOfObjects()
+    {
+        using (var tr = _db.StartTransaction())
+        {
+            var creator = tr.InitRelation<IRecordWithMetadataRelation>("RecordWithMetadata");
+            var table = creator(tr);
+            table.Insert(new RecordWithMetadata
+            {
+                CompanyId = 1,
+                ProviderId = 1,
+                UserId = "user1",
+                UserName = "User One",
+                CreatedDate = new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                Metadata = new MetadataContainer
+                {
+                    Global = new Dictionary<string, MetadataValue>
+                    {
+                        { "key1", new MetadataValue { StringValue = "value1", IsReadOnly = true } },
+                        { "key2", new MetadataValue { StringValue = "value2", IsReadOnly = true } }
+                    },
+                    Application = new Dictionary<ulong, Dictionary<string, MetadataValue>>
+                    {
+                        {
+                            100, new Dictionary<string, MetadataValue>
+                            {
+                                { "appKey1", new MetadataValue { StringValue = "appValue1", IsReadOnly = false } }
+                            }
+                        }
+                    }
+                }
+            });
+            tr.Commit();
+        }
+
+        using (var tr = _db.StartTransaction())
+        {
+            var visitor = new ToStringVisitor();
+            var iterator = new ODBIterator(tr, visitor);
+            iterator.Iterate();
+            var text = visitor.ToString();
+            Assert.Contains("key1", text);
+            Assert.Contains("value1", text);
+        }
+    }
+
+    [Fact]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public void IterateRelationWithInlineDictAfterRemove()
+    {
+        using (var tr = _db.StartTransaction())
+        {
+            var creator = tr.InitRelation<IRecordWithMetadataRelation>("RecordWithMetadata");
+            var table = creator(tr);
+            var metadata = new MetadataContainer
+            {
+                Global = new Dictionary<string, MetadataValue>
+                {
+                    { "key1", new MetadataValue { StringValue = "value1" } },
+                    { "key2", new MetadataValue { StringValue = "value2", IsReadOnly = true } }
+                },
+                Application = new Dictionary<ulong, Dictionary<string, MetadataValue>>
+                {
+                    {
+                        100, new Dictionary<string, MetadataValue>
+                        {
+                            { "appKey1", new MetadataValue { StringValue = "appValue1" } },
+                            { "appKey2", new MetadataValue { StringValue = "appValue2", IsReadOnly = true } }
+                        }
+                    }
+                }
+            };
+            // Remove an entry to cause _count != Count (internal _freeCount > 0)
+            metadata.Global.Remove("key1");
+            metadata.Application[100].Remove("appKey1");
+
+            table.Insert(new RecordWithMetadata
+            {
+                CompanyId = 1,
+                ProviderId = 1,
+                UserId = "user1",
+                UserName = "User One",
+                CreatedDate = new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                Metadata = metadata
+            });
+            tr.Commit();
+        }
+
+        using (var tr = _db.StartTransaction())
+        {
+            var visitor = new ToStringVisitor();
+            var iterator = new ODBIterator(tr, visitor);
+            iterator.Iterate();
+            var text = visitor.ToString();
+            Assert.Contains("key2", text);
+            Assert.Contains("value2", text);
+            Assert.Contains("appKey2", text);
+            Assert.Contains("appValue2", text);
+            Assert.DoesNotContain("key1", text);
+            Assert.DoesNotContain("appKey1", text);
+        }
+    }
+
+    public class BitmapRecord
+    {
+        [PrimaryKey] public ulong Id { get; set; }
+        public IRoaringBitmap Bits { get; set; }
+    }
+
+    public interface IBitmapRecordRelation : IRelation<BitmapRecord>
+    {
+        void Insert(BitmapRecord value);
+    }
+
+    [Fact]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public void IterateRelationWithRoaringBitmap()
+    {
+        ulong bitmapId;
+        using (var tr = _db.StartTransaction())
+        {
+            var creator = tr.InitRelation<IBitmapRecordRelation>("BitmapRecord");
+            var table = creator(tr);
+            var bitmap = new ODBRoaringBitmap((IInternalObjectDBTransaction)tr);
+            bitmapId = bitmap.Id;
+            bitmap.Set(1, true);
+            bitmap.Set(65536 + 2, true);
+            bitmap.Set(65536 + 5, true);
+            bitmap.Flush();
+            table.Insert(new BitmapRecord { Id = 1, Bits = bitmap });
+            tr.Commit();
+        }
+
+        using (var tr = _db.StartTransaction())
+        {
+            var visitor = new ToStringVisitor();
+            var iterator = new ODBIterator(tr, visitor);
+            iterator.Iterate();
+            var text = visitor.ToString();
+            var first = text.IndexOf("ScalarStr 1", StringComparison.Ordinal);
+            var second = text.IndexOf("ScalarStr 65538", StringComparison.Ordinal);
+            var third = text.IndexOf("ScalarStr 65541", StringComparison.Ordinal);
+            Assert.Contains("ScalarStr Count 3", text);
+            Assert.True(first >= 0);
+            Assert.True(second > first);
+            Assert.True(third > second);
+            var keyPrefix = ExternalContentPrefixText(bitmapId);
+            Assert.Contains($"Used key: {keyPrefix} Value len:1", text);
+            Assert.Contains($"Used key: {keyPrefix} 00", text);
+            Assert.Contains($"Used key: {keyPrefix} 01", text);
+        }
+    }
+
+    [Fact]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public void IterateRelationWithIncompleteRoaringBitmap()
+    {
+        using (var tr = _db.StartTransaction())
+        {
+            var creator = tr.InitRelation<IBitmapRecordRelation>("BitmapRecord");
+            var table = creator(tr);
+            var bitmap = new ODBRoaringBitmap((IInternalObjectDBTransaction)tr);
+            bitmap.ApplyCommands(new byte[] { 1, 0, 2, 0, 1, 0 });
+            table.Insert(new BitmapRecord { Id = 1, Bits = bitmap });
+            tr.Commit();
+        }
+
+        using (var tr = _db.StartTransaction())
+        {
+            var visitor = new ToStringVisitor();
+            var iterator = new ODBIterator(tr, visitor);
+            iterator.Iterate();
+            var text = visitor.ToString();
+            Assert.Contains("ScalarStr 1", text);
+            Assert.Contains("ScalarStr Incomplete", text);
+        }
+    }
+
+    static string ExternalContentPrefixText(ulong id)
+    {
+        var len = PackUnpack.LengthVUInt(id);
+        var array = new byte[1 + len];
+        array[0] = ObjectDB.AllDictionariesPrefixByte;
+        PackUnpack.UnsafePackVUInt(ref array[1], id, len);
+        var builder = new StringBuilder();
+        for (var i = 0; i < array.Length; i++)
+        {
+            if (i > 0) builder.Append(' ');
+            builder.Append(array[i].ToString("X2"));
+        }
+
+        return builder.ToString();
     }
 }

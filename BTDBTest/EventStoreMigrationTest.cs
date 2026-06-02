@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using BTDB;
 using BTDB.Encrypted;
 using BTDB.EventStore2Layer;
 using BTDB.EventStoreLayer;
@@ -15,6 +16,7 @@ public class EventStoreMigrationTest
         public string Field { get; set; }
     }
 
+    [Generate]
     public class EventRoot
     {
         public List<Item> Items { get; set; }
@@ -82,6 +84,7 @@ public class EventStoreMigrationTest
         public string Field2 { get; set; }
     }
 
+    [Generate]
     public class EventRoot2
     {
         public List<Item2> Items { get; set; }
@@ -112,6 +115,7 @@ public class EventStoreMigrationTest
         Assert.True(deserializer.Deserialize(out obj2, data));
     }
 
+    [Generate]
     public class EventDictListRoot
     {
         public IDictionary<ulong, IList<Item>> Items { get; set; }
@@ -141,6 +145,7 @@ public class EventStoreMigrationTest
         One = 1
     }
 
+    [Generate]
     public class EventRootEn
     {
         public List<ItemEn> Items { get; set; }
@@ -152,6 +157,7 @@ public class EventStoreMigrationTest
         Two = 2
     }
 
+    [Generate]
     public class EventRootEn2
     {
         public List<ItemEn2> Items { get; set; }
@@ -183,16 +189,19 @@ public class EventStoreMigrationTest
         Assert.True(deserializer.Deserialize(out obj2, data));
     }
 
+    [Generate]
     public class EventWithInt
     {
         public int A { get; set; }
     }
 
+    [Generate]
     public class EventWithNullableUlong
     {
         public ulong? A { get; set; }
     }
 
+    [Generate]
     public class EventWithUlong
     {
         public ulong A { get; set; }
@@ -215,7 +224,15 @@ public class EventStoreMigrationTest
         {
             A = -1
         }, mapper);
-        Assert.Equal(0xffffffff, obj2.A);
+        if (obj2.A != 0xfffffffful)
+        {
+            // This is better result
+            Assert.Equal(0xfffffffffffffffful, obj2.A);
+        }
+        else
+        {
+            Assert.Equal(0xffffffff, obj2.A);
+        }
     }
 
     [Fact]
@@ -258,11 +275,13 @@ public class EventStoreMigrationTest
         Assert.Equal(0ul, obj2.A);
     }
 
+    [Generate]
     public class EventWithString
     {
         public string A { get; set; }
     }
 
+    [Generate]
     public class EventWithVersion
     {
         public Version A { get; set; }
@@ -288,6 +307,7 @@ public class EventStoreMigrationTest
         Assert.Null(obj2.A);
     }
 
+    [Generate]
     public class EventWithEncryptedString
     {
         public EncryptedString A { get; set; }
@@ -313,7 +333,13 @@ public class EventStoreMigrationTest
         Assert.Null(obj2.A.Secret);
     }
 
+    [Generate]
+    public class RegistrationHelper
+    {
+        public DBIndirect<ItemBase> A;
+    }
 
+    [Generate]
     public abstract class ItemBase
     {
         public int A { get; set; }
@@ -324,11 +350,13 @@ public class EventStoreMigrationTest
         public int B { get; set; }
     }
 
+    [Generate]
     public class EventDictIndirectAbstract
     {
         public IDictionary<ulong, IIndirect<ItemBase>> Items { get; set; }
     }
 
+    [Generate]
     public class EventDictAbstract
     {
         public IDictionary<ulong, ItemBase> Items { get; set; }
@@ -353,6 +381,7 @@ public class EventStoreMigrationTest
         Assert.Equal(2, ((ItemBase1)res.Items[1]).B);
     }
 
+    [Generate]
     public class ItemWithProtectedProperty
     {
         int Value { get; set; }

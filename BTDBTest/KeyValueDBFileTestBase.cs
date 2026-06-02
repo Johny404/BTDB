@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using BTDB.Buffer;
@@ -333,7 +335,7 @@ public abstract class KeyValueDBFileTestBase : KeyValueDBTestBase
     }
 
     [Fact]
-    public void CompactionDoesNotRemoveStillUsedFiles()
+    public async Task CompactionDoesNotRemoveStillUsedFiles()
     {
         using var fileCollection = new InMemoryFileCollection();
         using var db = NewKeyValueDB(fileCollection, new NoCompressionStrategy(), 1024, null);
@@ -354,10 +356,10 @@ public abstract class KeyValueDBFileTestBase : KeyValueDBTestBase
             tr.Commit();
         }
 
-        db.Compact(new CancellationToken());
+        await db.Compact(CancellationToken.None);
         Assert.Equal(3u, fileCollection.GetCount()); // 2 Logs, 1 KeyIndex
         longTr.Dispose();
-        db.Compact(new CancellationToken());
+        await db.Compact(CancellationToken.None);
         Assert.Equal(2u, fileCollection.GetCount()); // 1 Log, 1 KeyIndex
         using (var tr = db.StartTransaction())
         {
@@ -377,7 +379,7 @@ public abstract class KeyValueDBFileTestBase : KeyValueDBTestBase
     }
 
     [Fact]
-    public void CompactionStabilizedEvenWithOldTransactions()
+    public async Task CompactionStabilizedEvenWithOldTransactions()
     {
         using var fileCollection = new InMemoryFileCollection();
         using var db = NewKeyValueDB(fileCollection, new NoCompressionStrategy(), 10240, null);
@@ -398,22 +400,68 @@ public abstract class KeyValueDBFileTestBase : KeyValueDBTestBase
             tr.Commit();
         }
 
-        var longTr = db.StartTransaction();
-        db.Compact(new CancellationToken());
-        Assert.Equal(4u, fileCollection.GetCount()); // 2 Logs, 1 values, 1 KeyIndex
-        db.Compact(new CancellationToken());
-        Assert.Equal(4u, fileCollection.GetCount()); // 2 Logs, 1 values, 1 KeyIndex
-        longTr.Dispose();
-        db.Compact(new CancellationToken());
+        Assert.Equal(2u, fileCollection.GetCount()); // 2 Logs
+
+        using (var longTr = db.StartTransaction())
+        {
+            await db.Compact(CancellationToken.None);
+            Assert.Equal(3u, fileCollection.GetCount()); // 2 Logs, 1 KeyIndex
+            await db.Compact(CancellationToken.None);
+            Assert.Equal(3u, fileCollection.GetCount()); // 2 Logs, 1 KeyIndex
+        }
+
+        await db.Compact(CancellationToken.None);
         Assert.Equal(3u, fileCollection.GetCount()); // 1 Log, 1 values, 1 KeyIndex
     }
 
+    byte[] CreateBigKey(int id, int length)
+    {
+        var key = new byte[length];
+        PackUnpack.PackInt32BE(key, 0, id);
+        return key;
+    }
+
     [Fact]
-    public void PreapprovedCommitAndCompaction()
+    public async Task SmallCompactionDoesNotCorruptDB()
+    {
+        using var fileCollection = new InMemoryFileCollection();
+        using var db = NewKeyValueDB(fileCollection, new NoCompressionStrategy(), 10240, null);
+        using (var tr = db.StartTransaction())
+        {
+            using var cursor = tr.CreateCursor();
+            for (var i = 0; i < 10; i++)
+            {
+                cursor.CreateOrUpdateKeyValue(CreateBigKey(i, 4000), new byte[4000]);
+            }
+
+            tr.Commit();
+        }
+
+        await db.Compact(CancellationToken.None);
+        Assert.Equal("9:TRL 10:TRL 11:PVL 12:PVL 13:PVL 14:PVL 15:KVI", fileCollection.CalcFileStats());
+        using (var tr = db.StartTransaction())
+        {
+            using var cursor = tr.CreateCursor();
+            for (var i = 4; i < 10; i++)
+            {
+                cursor.FindExactKey(CreateBigKey(i, 4000));
+                cursor.EraseCurrent();
+            }
+
+            tr.Commit();
+        }
+
+        Assert.Equal("9:TRL 10:TRL 11:PVL 12:PVL 13:PVL 14:PVL 15:KVI 16:TRL 17:TRL", fileCollection.CalcFileStats());
+        await db.Compact(CancellationToken.None);
+        Assert.Equal("11:PVL 12:PVL 17:TRL 18:KVI", fileCollection.CalcFileStats());
+    }
+
+    [Fact]
+    public async Task PreapprovedCommitAndCompaction()
     {
         using var fileCollection = new InMemoryFileCollection();
         using var db = NewKeyValueDB(fileCollection, new NoCompressionStrategy(), 1024);
-        using (var tr = db.StartWritingTransaction().Result)
+        using (var tr = await db.StartWritingTransaction())
         {
             using var cursor = tr.CreateCursor();
             cursor.CreateOrUpdateKeyValue(Key1, new byte[1024]);
@@ -421,8 +469,8 @@ public abstract class KeyValueDBFileTestBase : KeyValueDBTestBase
             tr.Commit();
         }
 
-        db.Compact(new CancellationToken());
-        using (var tr = db.StartWritingTransaction().Result)
+        await db.Compact(CancellationToken.None);
+        using (var tr = await db.StartWritingTransaction())
         {
             using var cursor = tr.CreateCursor();
             cursor.FindKeyIndex(0);
@@ -430,7 +478,7 @@ public abstract class KeyValueDBFileTestBase : KeyValueDBTestBase
             tr.Commit();
         }
 
-        db.Compact(new CancellationToken());
+        await db.Compact(CancellationToken.None);
         using (var db2 = NewKeyValueDB(fileCollection, new NoCompressionStrategy(), 1024))
         {
             using (var tr = db2.StartTransaction())
@@ -545,7 +593,7 @@ public abstract class KeyValueDBFileTestBase : KeyValueDBTestBase
     }
 
     [Fact]
-    public void BigCompaction()
+    public async Task BigCompaction()
     {
         using var fileCollection = new InMemoryFileCollection();
         var logger = new LoggerMock();
@@ -593,12 +641,12 @@ public abstract class KeyValueDBFileTestBase : KeyValueDBTestBase
             tr.Commit();
         }
 
-        db.Compact(CancellationToken.None);
+        await db.Compact(CancellationToken.None);
         Assert.Equal(93u, logger.MarkedForDeleteCount);
         Assert.Equal(
             "Compactor didn't removed all waste (2375267), because it created 20 PVL files already. Remaining waste left to next compaction.",
             logger.LastWarning);
-        db.Compact(CancellationToken.None);
+        await db.Compact(CancellationToken.None);
         Assert.Equal(174u, logger.MarkedForDeleteCount);
         Assert.Equal(
             "Compactor didn't removed all waste (1859507), because it created 20 PVL files already. Remaining waste left to next compaction.",
@@ -667,7 +715,7 @@ public abstract class KeyValueDBFileTestBase : KeyValueDBTestBase
     }
 
     [Fact]
-    public void CompactorEvenWithLossOfNotFlushedDataWillNotAnyData()
+    public async Task CompactorEvenWithLossOfNotFlushedDataWillNotAnyData()
     {
         using var fc = new InMemoryFileCollection();
         {
@@ -684,7 +732,7 @@ public abstract class KeyValueDBFileTestBase : KeyValueDBTestBase
                 cursor.CreateOrUpdateKeyValue(new byte[40], new byte[560]);
                 tr.Commit();
             }
-            db.Compact(CancellationToken.None);
+            await db.Compact(CancellationToken.None);
 
             {
                 using var tr = db.StartTransaction();
@@ -694,7 +742,7 @@ public abstract class KeyValueDBFileTestBase : KeyValueDBTestBase
                 cursor.CreateOrUpdateKeyValue(new byte[10], new byte[100]);
                 tr.Commit();
             }
-            db.Compact(CancellationToken.None);
+            await db.Compact(CancellationToken.None);
             fc.SimulateDataLossOfNotFlushedData();
         }
         {

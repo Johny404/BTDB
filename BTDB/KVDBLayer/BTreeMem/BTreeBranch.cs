@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using BTDB.Collections;
 
@@ -491,7 +490,7 @@ class BTreeBranch : IBTreeNode
         }
     }
 
-    public void FastIterate(int deepness, ref StructList<NodeIdxPair> stack, ref long keyIndex,
+    public bool FastIterate(int deepness, ref StructList<NodeIdxPair> stack, ref long keyIndex,
         CursorIterateCallback callback)
     {
         if (deepness == stack.Count)
@@ -501,9 +500,13 @@ class BTreeBranch : IBTreeNode
 
         for (var i = stack[deepness].Idx; i < _children.Length; i++, stack[deepness].Idx++)
         {
-            _children[i].FastIterate(deepness + 1, ref stack, ref keyIndex, callback);
+            if (_children[i].FastIterate(deepness + 1, ref stack, ref keyIndex, callback))
+            {
+                return true;
+            }
         }
 
         stack.Pop();
+        return false;
     }
 }

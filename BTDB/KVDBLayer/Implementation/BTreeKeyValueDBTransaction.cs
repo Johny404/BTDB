@@ -15,6 +15,9 @@ public class BTreeKeyValueDBTransaction : IKeyValueDBTransaction
     bool _writing;
     bool _preapprovedWriting;
     bool _temporaryCloseTransactionLog;
+    bool _disposed;
+    internal IKeyValueDBCursor? Reused1;
+    internal IKeyValueDBCursor? Reused2;
 
     public DateTime CreatedTime { get; } = DateTime.UtcNow;
 
@@ -36,7 +39,23 @@ public class BTreeKeyValueDBTransaction : IKeyValueDBTransaction
     public IKeyValueDBCursor CreateCursor()
     {
         ObjectDisposedException.ThrowIf(BTreeRoot == null, this);
-        return BTreeKeyValueDBCursor.Create(this);
+        if (Reused1 != null)
+        {
+            var cursor = Reused1;
+            Reused1 = null;
+            ((BTreeKeyValueDBCursor)cursor).Disposed = false;
+            return cursor;
+        }
+
+        if (Reused2 != null)
+        {
+            var cursor = Reused2;
+            Reused2 = null;
+            ((BTreeKeyValueDBCursor)cursor).Disposed = false;
+            return cursor;
+        }
+
+        return BTreeKeyValueDBCursor.Create(this, _writing || _preapprovedWriting);
     }
 
     internal void MakeWritable()
@@ -142,6 +161,23 @@ public class BTreeKeyValueDBTransaction : IKeyValueDBTransaction
 
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+
+        var reused1 = Reused1;
+        Reused1 = null;
+        if (reused1 != null)
+        {
+            ((BTreeKeyValueDBCursor)reused1).RealDispose(this);
+        }
+
+        var reused2 = Reused2;
+        Reused2 = null;
+        if (reused2 != null)
+        {
+            ((BTreeKeyValueDBCursor)reused2).RealDispose(this);
+        }
+
         if (FirstCursor != null)
         {
             throw new BTDBException("Forgot to dispose cursor for transaction " + _descriptionForLeaks);

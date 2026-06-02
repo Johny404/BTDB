@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Threading;
+using System.Threading.Tasks;
 using BTDB.KVDBLayer;
 using BTDB.ODBLayer;
 using Xunit;
@@ -240,7 +241,7 @@ public class KeyValueDBRollbackTest
     }
 
     [Fact]
-    public void ComplexTrlRollback()
+    public async Task ComplexTrlRollback()
     {
         using var fileCollection = new InMemoryFileCollection();
         var options = new KeyValueDBOptions
@@ -260,7 +261,7 @@ public class KeyValueDBRollbackTest
 
             for (ulong i = 0; i < 100; i += 3)
             {
-                using var tr = objDb.StartWritingTransaction().Result;
+                using var tr = await objDb.StartWritingTransaction();
                 var person = tr.Singleton<Person>();
                 person.Age = (uint)i;
                 tr.Store(person);
@@ -290,7 +291,7 @@ public class KeyValueDBRollbackTest
 
             for (ulong i = 10; i < 200; i += 5)
             {
-                using var tr = objDb.StartWritingTransaction().Result;
+                using var tr = await objDb.StartWritingTransaction();
                 var person = tr.Singleton<Person>();
                 person.Age = (uint)i;
                 tr.Store(person);
@@ -321,7 +322,7 @@ public class KeyValueDBRollbackTest
     }
 
     [Fact]
-    public void ComplexTrlRollbackWhenKviLost()
+    public async Task ComplexTrlRollbackWhenKviLost()
     {
         using var fileCollection = new InMemoryFileCollection();
         var options = new KeyValueDBOptions
@@ -341,7 +342,7 @@ public class KeyValueDBRollbackTest
 
             for (ulong i = 0; i < 100; i += 3)
             {
-                using var tr = objDb.StartWritingTransaction().Result;
+                using var tr = await objDb.StartWritingTransaction();
                 var person = tr.Singleton<Person>();
                 person.Age = (uint)i;
                 tr.Store(person);
@@ -394,7 +395,7 @@ public class KeyValueDBRollbackTest
 
             for (ulong i = 10; i < 200; i += 5)
             {
-                using var tr = objDb.StartWritingTransaction().Result;
+                using var tr = await objDb.StartWritingTransaction();
                 var person = tr.Singleton<Person>();
                 person.Age = (uint)i;
                 tr.Store(person);
@@ -500,7 +501,7 @@ public class KeyValueDBRollbackTest
     }
 
     [Fact]
-    public void CompactorShouldNotBePessimist()
+    public async Task CompactorShouldNotBePessimist()
     {
         using var fileCollection = new InMemoryFileCollection();
         var options = new KeyValueDBOptions
@@ -516,7 +517,7 @@ public class KeyValueDBRollbackTest
         using var kvDb = new BTreeKeyValueDB(options);
         for (var i = 0; i < 100; i++)
         {
-            using var tr = kvDb.StartWritingTransaction().Result;
+            using var tr = await kvDb.StartWritingTransaction();
             using var cursor = tr.CreateCursor();
             var key = new byte[4];
             BTDB.Buffer.PackUnpack.PackInt32BE(key, 0, i);
@@ -526,11 +527,11 @@ public class KeyValueDBRollbackTest
         }
 
         kvDb.PreserveHistoryUpToCommitUlong = 100;
-        kvDb.Compact(new CancellationToken());
+        await kvDb.Compact(new CancellationToken());
         var fileCountAfterFirstCompaction = fileCollection.GetCount();
         for (var i = 0; i < 50; i++)
         {
-            using var tr = kvDb.StartWritingTransaction().Result;
+            using var tr = await kvDb.StartWritingTransaction();
             using var cursor = tr.CreateCursor();
             var key = new byte[4];
             BTDB.Buffer.PackUnpack.PackInt32BE(key, 0, i);
@@ -541,13 +542,13 @@ public class KeyValueDBRollbackTest
         }
 
         kvDb.PreserveHistoryUpToCommitUlong = 150;
-        kvDb.Compact(new CancellationToken());
+        await kvDb.Compact(new CancellationToken());
         Assert.InRange(fileCollection.GetCount(), fileCountAfterFirstCompaction + 1, fileCountAfterFirstCompaction + 3);
         using (kvDb.StartReadOnlyTransaction())
         {
             for (var i = 50; i < 100; i++)
             {
-                using var tr = kvDb.StartWritingTransaction().Result;
+                using var tr = await kvDb.StartWritingTransaction();
                 using var cursor = tr.CreateCursor();
                 var key = new byte[4];
                 BTDB.Buffer.PackUnpack.PackInt32BE(key, 0, i);
@@ -557,21 +558,21 @@ public class KeyValueDBRollbackTest
                 tr.Commit();
             }
 
-            kvDb.Compact(new CancellationToken());
+            await kvDb.Compact(new CancellationToken());
             Assert.InRange(fileCollection.GetCount(), fileCountAfterFirstCompaction / 3,
                 2 * fileCountAfterFirstCompaction / 3);
             kvDb.PreserveHistoryUpToCommitUlong = 200;
-            kvDb.Compact(new CancellationToken());
+            await kvDb.Compact(new CancellationToken());
             Assert.InRange(fileCollection.GetCount(), fileCountAfterFirstCompaction / 3,
                 2 * fileCountAfterFirstCompaction / 3);
         }
 
-        kvDb.Compact(new CancellationToken());
+        await kvDb.Compact(new CancellationToken());
         Assert.InRange<uint>(fileCollection.GetCount(), 1, 4);
     }
 
     [Fact]
-    public void CompactorShouldNotBePessimistDespiteRunningTransactions()
+    public async Task CompactorShouldNotBePessimistDespiteRunningTransactions()
     {
         using var fileCollection = new InMemoryFileCollection();
         var options = new KeyValueDBOptions
@@ -585,7 +586,7 @@ public class KeyValueDBRollbackTest
         using var kvDb = new BTreeKeyValueDB(options);
         for (var i = 0; i < 100; i++)
         {
-            using var tr = kvDb.StartWritingTransaction().Result;
+            using var tr = await kvDb.StartWritingTransaction();
             using var cursor = tr.CreateCursor();
             var key = new byte[4];
             BTDB.Buffer.PackUnpack.PackInt32BE(key, 0, i);
@@ -593,13 +594,13 @@ public class KeyValueDBRollbackTest
             tr.Commit();
         }
 
-        kvDb.Compact(new CancellationToken());
+        await kvDb.Compact(new CancellationToken());
         var fileCountAfterFirstCompaction = fileCollection.GetCount();
         using (kvDb.StartReadOnlyTransaction())
         {
             for (var i = 0; i < 50; i++)
             {
-                using var tr = kvDb.StartWritingTransaction().Result;
+                using var tr = await kvDb.StartWritingTransaction();
                 using var cursor = tr.CreateCursor();
                 var key = new byte[4];
                 BTDB.Buffer.PackUnpack.PackInt32BE(key, 0, i * 2);
@@ -608,7 +609,7 @@ public class KeyValueDBRollbackTest
                 tr.Commit();
             }
 
-            while (kvDb.Compact(new CancellationToken()))
+            while (await kvDb.Compact(new CancellationToken()))
             {
             }
 
@@ -618,7 +619,7 @@ public class KeyValueDBRollbackTest
 
         for (var i = 0; i < 4; i++)
         {
-            using var tr = kvDb.StartWritingTransaction().Result;
+            using var tr = await kvDb.StartWritingTransaction();
             using var cursor = tr.CreateCursor();
             var key = new byte[4];
             BTDB.Buffer.PackUnpack.PackInt32BE(key, 0, i);
@@ -626,7 +627,7 @@ public class KeyValueDBRollbackTest
             tr.Commit();
         }
 
-        while (kvDb.Compact(new CancellationToken()))
+        while (await kvDb.Compact(CancellationToken.None))
         {
         }
 
@@ -635,7 +636,7 @@ public class KeyValueDBRollbackTest
     }
 
     [Fact]
-    public void CanOpenDbAfterDeletingAndCompacting()
+    public async Task CanOpenDbAfterDeletingAndCompacting()
     {
         using var fileCollection = new InMemoryFileCollection();
         var options = new KeyValueDBOptions
@@ -650,7 +651,7 @@ public class KeyValueDBRollbackTest
 
         using (var kvDb = new BTreeKeyValueDB(options))
         {
-            using (var tr = kvDb.StartWritingTransaction().Result)
+            using (var tr = await kvDb.StartWritingTransaction())
             {
                 using var cursor = tr.CreateCursor();
                 cursor.CreateOrUpdateKeyValue(new byte[5], new byte[3000]);
@@ -658,12 +659,13 @@ public class KeyValueDBRollbackTest
                 tr.Commit();
             }
 
-            kvDb.Compact(CancellationToken.None);
+            await kvDb.Compact(CancellationToken.None);
+            Assert.Equal("1:TRL 2:TRL 3:KVI", fileCollection.CalcFileStats());
         }
 
         using (var kvDb = new BTreeKeyValueDB(options))
         {
-            using (var tr = kvDb.StartWritingTransaction().Result)
+            using (var tr = await kvDb.StartWritingTransaction())
             {
                 using var cursor = tr.CreateCursor();
                 cursor.FindFirstKey(new());
@@ -671,13 +673,13 @@ public class KeyValueDBRollbackTest
                 tr.Commit();
             }
 
-            kvDb.Compact(CancellationToken.None);
+            await kvDb.Compact(CancellationToken.None);
+            Assert.Equal("2:TRL 4:KVI", fileCollection.CalcFileStats());
         }
 
         using (var kvDb = new BTreeKeyValueDB(options))
         {
-            // If there is error in KVI 3 it will create new KVI 4, but there is no problem in KVI 3
-            Assert.Null(kvDb.FileCollection.FileInfoByIdx(4));
+            Assert.Equal("2:TRL 4:KVI", fileCollection.CalcFileStats());
         }
     }
 }

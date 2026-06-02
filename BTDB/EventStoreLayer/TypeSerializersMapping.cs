@@ -8,6 +8,7 @@ using BTDB.FieldHandler;
 using BTDB.IL;
 using BTDB.KVDBLayer;
 using BTDB.ODBLayer;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
 
 namespace BTDB.EventStoreLayer;
@@ -171,6 +172,27 @@ class TypeSerializersMapping : ITypeSerializersMapping, ITypeSerializersLightMap
         }
 
         public bool AnyOpNeedsCtx()
+        {
+            throw new InvalidOperationException();
+        }
+
+        public Layer2Loader GenerateLoad(Type targetType, ITypeConverterFactory typeConverterFactory)
+        {
+            throw new InvalidOperationException();
+        }
+
+        public void Skip(ref MemReader reader, ITypeBinaryDeserializerContext? ctx)
+        {
+            throw new InvalidOperationException();
+        }
+
+        public Layer2Saver GenerateSave(Type targetType, ITypeConverterFactory typeConverterFactory)
+        {
+            throw new InvalidOperationException();
+        }
+
+        public Layer2NewDescriptor? GenerateNewDescriptor(Type targetType, ITypeConverterFactory typeConverterFactory,
+            bool forbidSerializationOfLazyDBObjects)
         {
             throw new InvalidOperationException();
         }
@@ -662,7 +684,7 @@ class TypeSerializersMapping : ITypeSerializersMapping, ITypeSerializersLightMap
 
     public InfoForType GetInfoFromObject(object obj, out TypeSerializers typeSerializers)
     {
-        InfoForType infoForType;
+        InfoForType? infoForType;
         if (obj is IKnowDescriptor iKnowDescriptor)
         {
             var descriptor = iKnowDescriptor.GetDescriptor();

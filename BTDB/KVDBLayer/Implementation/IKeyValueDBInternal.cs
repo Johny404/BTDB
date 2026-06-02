@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Threading;
+using System.Threading.Tasks;
 using BTDB.Collections;
 using BTDB.StreamLayer;
 
@@ -11,7 +12,9 @@ public delegate void ValuesIterateAction(uint valueFileId, uint valueOfs, int va
 interface IKeyValueDBInternal : IKeyValueDB
 {
     long GetGeneration(uint fileId);
-    void MarkAsUnknown(IEnumerable<uint> fileIds);
+
+    // Returns true if any marked file was TRL
+    bool MarkAsUnknown(IEnumerable<uint> fileIds);
     IFileCollectionWithFileInfos FileCollection { get; }
     bool ContainsValuesAndDoesNotTouchGeneration(uint fileKey, long dontTouchGeneration);
 
@@ -24,7 +27,7 @@ interface IKeyValueDBInternal : IKeyValueDB
     IRootNodeInternal ReferenceAndGetLastCommitted();
     void DereferenceRootNodeInternal(IRootNodeInternal root);
 
-    long ReplaceBTreeValues(CancellationToken cancellation, RefDictionary<ulong, uint> newPositionMap,
+    ValueTask<long> ReplaceBTreeValues(CancellationToken cancellation, RefDictionary<ulong, uint> newPositionMap,
         uint targetFileId);
 
     long[] CreateIndexFile(CancellationToken cancellation, long preserveKeyIndexGeneration);

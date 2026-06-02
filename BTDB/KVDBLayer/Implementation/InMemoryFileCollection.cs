@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using BTDB.Buffer;
 using BTDB.StreamLayer;
@@ -28,6 +30,41 @@ public class InMemoryFileCollection : IFileCollection
         {
             filesValue.SimulateDataLossOfNotFushedData();
         }
+    }
+
+    public string CalcFileStats()
+    {
+        Span<byte> typeBuffer = stackalloc byte[22];
+        var sb = new StringBuilder();
+        foreach (var file in Enumerate().OrderBy(f => f.Index))
+        {
+            file.RandomRead(typeBuffer, 0, true);
+            switch ((KVFileType)typeBuffer[21])
+            {
+                case KVFileType.PureValues:
+                case KVFileType.PureValuesWithId:
+                    sb.Append(file.Index);
+                    sb.Append(":PVL ");
+                    break;
+                case KVFileType.TransactionLog:
+                    sb.Append(file.Index);
+                    sb.Append(":TRL ");
+                    break;
+                case KVFileType.KeyIndex:
+                case KVFileType.KeyIndexWithCommitUlong:
+                case KVFileType.ModernKeyIndex:
+                case KVFileType.ModernKeyIndexWithUlongs:
+                    sb.Append(file.Index);
+                    sb.Append(":KVI ");
+                    break;
+                default:
+                    throw new InvalidDataException("Unknown file type " + (KVFileType)typeBuffer[21] + " on file " +
+                                                   file.Index + " " + Convert.ToHexString(typeBuffer));
+            }
+        }
+
+        sb.Remove(sb.Length - 1, 1);
+        return sb.ToString();
     }
 
     class File : IFileCollectionFile
@@ -267,11 +304,7 @@ public class InMemoryFileCollection : IFileCollection
 
         public void HardFlush()
         {
-            // We are only in memory, so nothing to do
-        }
-
-        public void Truncate()
-        {
+            // We are only in memory, so nothing to do, only remember last true flushed size to be able to simulate data loss
             _lastTrueFlushedSize = _flushedSize;
         }
 

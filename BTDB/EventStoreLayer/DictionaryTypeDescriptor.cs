@@ -6,7 +6,10 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
+using BTDB.KVDBLayer;
+using BTDB.Serialization;
 
 namespace BTDB.EventStoreLayer;
 
@@ -86,7 +89,7 @@ class DictionaryTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
         _keyDescriptor!.BuildHumanReadableFullName(text, stack, indent);
         text.Append(", ");
         _valueDescriptor!.BuildHumanReadableFullName(text, stack, indent);
-        text.Append(">");
+        text.Append('>');
     }
 
     public bool Equals(ITypeDescriptor other, Dictionary<ITypeDescriptor, ITypeDescriptor>? equalities)
@@ -126,6 +129,238 @@ class DictionaryTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
         return !_keyDescriptor!.StoredInline || !_valueDescriptor!.StoredInline
                                              || _keyDescriptor.AnyOpNeedsCtx()
                                              || _valueDescriptor.AnyOpNeedsCtx();
+    }
+
+    ref struct DictionaryKeyValueLoaderCtx
+    {
+        internal nint KeyStoragePtr;
+        internal nint ValueStoragePtr;
+        internal object Object;
+        internal Layer2Loader KeyLoader;
+        internal Layer2Loader ValueLoader;
+        internal unsafe delegate*<object, ref byte, ref byte, void> Adder;
+        internal ITypeBinaryDeserializerContext? Ctx;
+        internal ref MemReader Reader;
+        internal unsafe delegate*<ref byte, ref IntPtr, delegate*<ref byte, void>, void> ValueStackAllocator;
+    }
+
+    public unsafe Layer2Loader GenerateLoad(Type targetType, ITypeConverterFactory typeConverterFactory)
+    {
+        if (targetType == typeof(object))
+        {
+            var genericKeyLoad = _keyDescriptor!.GenerateLoadEx(typeof(object), typeConverterFactory);
+            var genericValueLoad = _valueDescriptor!.GenerateLoadEx(typeof(object), typeConverterFactory);
+            return (ref reader, ctx, ref value) =>
+            {
+                var count = reader.ReadVUInt32();
+                if (count == 0)
+                {
+                    Unsafe.As<byte, object?>(ref value) = null;
+                    return;
+                }
+
+                count--;
+                var obj = new DictionaryWithDescriptor<object, object?>((int)count, this);
+                while (count-- != 0)
+                {
+                    object? key = null;
+                    object? val = null;
+                    genericKeyLoad(ref reader, ctx,
+                        ref Unsafe.As<object?, byte>(ref key));
+                    genericValueLoad(ref reader, ctx,
+                        ref Unsafe.As<object?, byte>(ref val));
+                    if (key != null) obj[key!] = val;
+                }
+
+                Unsafe.As<byte, object?>(ref value) = obj;
+            };
+        }
+
+        var collectionMetadata = ReflectionMetadata.FindCollectionByType(targetType);
+        if (collectionMetadata == null)
+            throw new BTDBException("Cannot find collection metadata for " + _type.ToSimpleName());
+        var keyLoad = _keyDescriptor!.GenerateLoadEx(collectionMetadata.ElementKeyType, typeConverterFactory);
+        var keyStackAllocator = ReflectionMetadata.FindStackAllocatorByType(collectionMetadata.ElementKeyType);
+        var valueLoad = _valueDescriptor!.GenerateLoadEx(collectionMetadata.ElementValueType!, typeConverterFactory);
+        var valueStackAllocator =
+            ReflectionMetadata.FindStackAllocatorByType(collectionMetadata.ElementValueType!);
+
+        return (ref reader, ctx, ref value) =>
+        {
+            var count = reader.ReadVUInt32();
+            if (count == 0)
+            {
+                Unsafe.As<byte, object?>(ref value) = null;
+                return;
+            }
+
+            count--;
+            var obj = collectionMetadata!.Creator(count);
+            if (_typeSerializers.PreserveDescriptors)
+                TypeSerializers.Object2DescriptorMap.Add(obj, this);
+            var loaderCtx = new DictionaryKeyValueLoaderCtx
+            {
+                Adder = collectionMetadata.AdderKeyValue,
+                KeyLoader = keyLoad,
+                ValueLoader = valueLoad,
+                Object = obj,
+                Ctx = ctx,
+                Reader = ref reader,
+                ValueStackAllocator = valueStackAllocator,
+            };
+            for (var i = 0; i != count; i++)
+            {
+                keyStackAllocator(ref Unsafe.As<DictionaryKeyValueLoaderCtx, byte>(ref loaderCtx),
+                    ref loaderCtx.KeyStoragePtr,
+                    &NestedValue);
+
+                static void NestedValue(ref byte value)
+                {
+                    ref var context = ref Unsafe.As<byte, DictionaryKeyValueLoaderCtx>(ref value);
+                    context.ValueStackAllocator(ref value, ref context.ValueStoragePtr, &Nested);
+                }
+
+                static void Nested(ref byte value)
+                {
+                    ref var context = ref Unsafe.As<byte, DictionaryKeyValueLoaderCtx>(ref value);
+                    context.KeyLoader(ref context.Reader, context.Ctx,
+                        ref Unsafe.AsRef<byte>((void*)context.KeyStoragePtr));
+                    context.ValueLoader(ref context.Reader, context.Ctx,
+                        ref Unsafe.AsRef<byte>((void*)context.ValueStoragePtr));
+                    context.Adder(context.Object, ref Unsafe.AsRef<byte>((void*)context.KeyStoragePtr),
+                        ref Unsafe.AsRef<byte>((void*)context.ValueStoragePtr));
+                }
+            }
+
+            Unsafe.As<byte, object?>(ref value) = obj;
+        };
+    }
+
+    public void Skip(ref MemReader reader, ITypeBinaryDeserializerContext? ctx)
+    {
+        var count = reader.ReadVUInt32();
+        if (count == 0) return;
+        count--;
+        for (var i = 0u; i != count; i++)
+        {
+            _keyDescriptor!.SkipEx(ref reader, ctx);
+            _valueDescriptor!.SkipEx(ref reader, ctx);
+        }
+    }
+
+    public Layer2Saver GenerateSave(Type targetType, ITypeConverterFactory typeConverterFactory)
+    {
+        var keyType = targetType.GenericTypeArguments[0];
+        var valueType = targetType.GenericTypeArguments[1];
+        var dictType = typeof(Dictionary<,>).MakeGenericType(targetType.GenericTypeArguments);
+        var saveKey = _keyDescriptor!.GenerateSaveEx(keyType, typeConverterFactory);
+        var saveValue = _valueDescriptor!.GenerateSaveEx(valueType, typeConverterFactory);
+        var layout = RawData.GetDictionaryEntriesLayout(keyType, valueType);
+        return (ref MemWriter writer, ITypeBinarySerializerContext? ctx, ref byte value) =>
+        {
+            var obj = Unsafe.As<byte, object>(ref value);
+            if (obj == null)
+            {
+                writer.WriteByteZero();
+                return;
+            }
+
+            var objType = obj.GetType();
+            if (dictType.IsAssignableFrom(objType))
+            {
+                var countFieldOffset = RawData.Align(8 + 6 * (uint)Unsafe.SizeOf<nint>(), 8);
+                var count = Unsafe.As<byte, int>(ref RawData.Ref(obj, countFieldOffset));
+                var freeCount = Unsafe.As<byte, int>(ref RawData.Ref(obj, countFieldOffset + 8));
+                writer.WriteVUInt32((uint)(count - freeCount) + 1);
+                if (count == 0) return;
+                obj = RawData.HashSetEntries(Unsafe.As<HashSet<object>>(obj));
+                ref readonly var mt = ref RawData.MethodTableRef(obj);
+                var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                var offsetDelta = mt.ComponentSize;
+                for (var i = 0; i < count; i++, offset += offsetDelta)
+                {
+                    if (Unsafe.As<byte, int>(ref RawData.Ref(obj, offset + layout.OffsetNext)) < -1)
+                    {
+                        continue;
+                    }
+
+                    saveKey(ref writer, ctx, ref RawData.Ref(obj, offset + layout.OffsetKey));
+                    saveValue(ref writer, ctx, ref RawData.Ref(obj, offset + layout.OffsetValue));
+                }
+            }
+            else if (obj is IInternalODBDictionary fromODBDictionary)
+            {
+                writer.WriteVUInt32((uint)fromODBDictionary.Count + 1);
+                var localWriter = writer;
+                fromODBDictionary.Iterate((ref byte key, ref byte value) =>
+                {
+                    saveKey(ref localWriter, ctx, ref key);
+                    saveValue(ref localWriter, ctx, ref value);
+                });
+                writer = localWriter;
+            }
+            else throw new BTDBException("Cannot save " + objType.ToSimpleName() + " as " + dictType.ToSimpleName());
+        };
+    }
+
+    public Layer2NewDescriptor? GenerateNewDescriptor(Type targetType, ITypeConverterFactory typeConverterFactory,
+        bool forbidSerializationOfLazyDBObjects)
+    {
+        if (_keyDescriptor!.Sealed && _valueDescriptor!.Sealed) return null;
+        var keyType = targetType.GenericTypeArguments[0];
+        var valueType = targetType.GenericTypeArguments[1];
+        var dictType = typeof(Dictionary<,>).MakeGenericType(targetType.GenericTypeArguments);
+        var saveKey =
+            _keyDescriptor!.GenerateNewDescriptorEx(keyType, typeConverterFactory, forbidSerializationOfLazyDBObjects);
+        var saveValue =
+            _valueDescriptor!.GenerateNewDescriptorEx(valueType, typeConverterFactory,
+                forbidSerializationOfLazyDBObjects);
+        var layout = RawData.GetDictionaryEntriesLayout(keyType, valueType);
+        return (IDescriptorSerializerLiteContext ctx, ref byte value) =>
+        {
+            var obj = Unsafe.As<byte, object>(ref value);
+            if (obj == null)
+            {
+                return;
+            }
+
+            var objType = obj.GetType();
+            if (dictType.IsAssignableFrom(objType))
+            {
+                var count = Unsafe.As<byte, int>(ref RawData.Ref(obj,
+                    RawData.Align(8 + 6 * (uint)Unsafe.SizeOf<nint>(), 8)));
+                if (count == 0) return;
+                obj = RawData.HashSetEntries(Unsafe.As<HashSet<object>>(obj));
+                ref readonly var mt = ref RawData.MethodTableRef(obj);
+                var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                var offsetDelta = mt.ComponentSize;
+                for (var i = 0; i < count; i++, offset += offsetDelta)
+                {
+                    if (Unsafe.As<byte, int>(ref RawData.Ref(obj, offset + layout.OffsetNext)) < -1)
+                    {
+                        continue;
+                    }
+
+                    saveKey?.Invoke(ctx, ref RawData.Ref(obj, offset + layout.OffsetKey));
+                    saveValue?.Invoke(ctx, ref RawData.Ref(obj, offset + layout.OffsetValue));
+                }
+            }
+            else if (obj is IInternalODBDictionary fromODBDictionary)
+            {
+                if (forbidSerializationOfLazyDBObjects)
+                {
+                    throw new BTDBException(
+                        "Lazy DB object serialization is forbidden. Type: " + objType.ToSimpleName());
+                }
+
+                fromODBDictionary.Iterate((ref byte key, ref byte value) =>
+                {
+                    saveKey?.Invoke(ctx, ref key);
+                    saveValue?.Invoke(ctx, ref value);
+                });
+            }
+            else throw new BTDBException("Cannot save " + objType.ToSimpleName() + " as " + dictType.ToSimpleName());
+        };
     }
 
     public void GenerateLoad(IILGen ilGenerator, Action<IILGen> pushReader, Action<IILGen> pushCtx,
@@ -214,9 +449,8 @@ class DictionaryTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
             var typeAsIDictionary = isDict ? type : typeof(IDictionary<,>).MakeGenericType(keyType, valueType);
             var getEnumeratorMethod = isDict
                 ? typeAsIDictionary.GetMethods()
-                    .Single(
-                        m => m.Name == nameof(IEnumerable.GetEnumerator) && m.ReturnType.IsValueType &&
-                             m.GetParameters().Length == 0)
+                    .Single(m => m.Name == nameof(IEnumerable.GetEnumerator) && m.ReturnType.IsValueType &&
+                                 m.GetParameters().Length == 0)
                 : typeAsIDictionary.GetInterface("IEnumerable`1")!.GetMethod(nameof(IEnumerable.GetEnumerator));
             var typeAsIEnumerator = getEnumeratorMethod!.ReturnType;
             var currentGetter = typeAsIEnumerator.GetProperty(nameof(IEnumerator.Current))!.GetGetMethod();

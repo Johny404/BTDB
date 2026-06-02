@@ -1,9 +1,9 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
     <PropertyGroup>
-        <TargetFramework>net9.0</TargetFramework>
+        <TargetFramework>net10.0</TargetFramework>
         <TargetLatestRuntimePatch>true</TargetLatestRuntimePatch>
         <LangVersion>latest</LangVersion>
-        <NoWarn>1701;1702;1720</NoWarn>
+        <NoWarn>1701;1702;1720;CS0219;CS8714</NoWarn>
         <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
         <Nullable>annotations</Nullable>
     </PropertyGroup>
@@ -26,5 +26,6 @@
     <ItemGroup>
         <ProjectReference Include="../BTDB/BTDB.csproj"/>
         <ProjectReference Include="../BTDB.SourceGenerator/BTDB.SourceGenerator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false"/>
+        <ProjectReference Include="../Sample3rdPartyLib/Sample3rdPartyLib.csproj"/>
     </ItemGroup>
 </Project>

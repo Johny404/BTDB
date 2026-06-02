@@ -1,10 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Runtime.InteropServices;
 using BTDB.Collections;
 using BTDB.KVDBLayer.BTreeMem;
-using BTDB.StreamLayer;
 
 namespace BTDB.KVDBLayer;
 
@@ -15,6 +13,9 @@ class InMemoryKeyValueDBTransaction : IKeyValueDBTransaction
     bool _writing;
     readonly bool _readOnly;
     bool _preapprovedWriting;
+    bool _disposed;
+    internal IKeyValueDBCursor? Reused1;
+    internal IKeyValueDBCursor? Reused2;
 
     public InMemoryKeyValueDBTransaction(InMemoryKeyValueDB keyValueDB, IBTreeRootNode btreeRoot, bool writing,
         bool readOnly)
@@ -28,7 +29,23 @@ class InMemoryKeyValueDBTransaction : IKeyValueDBTransaction
     public IKeyValueDBCursor CreateCursor()
     {
         ObjectDisposedException.ThrowIf(_btreeRoot == null, this);
-        return InMemoryKeyValueDBCursor.Create(this);
+        if (Reused1 != null)
+        {
+            var cursor = Reused1;
+            Reused1 = null;
+            ((InMemoryKeyValueDBCursor)cursor).Disposed = false;
+            return cursor;
+        }
+
+        if (Reused2 != null)
+        {
+            var cursor = Reused2;
+            Reused2 = null;
+            ((InMemoryKeyValueDBCursor)cursor).Disposed = false;
+            return cursor;
+        }
+
+        return InMemoryKeyValueDBCursor.Create(this, _writing || _preapprovedWriting);
     }
 
     internal void MakeWritable()
@@ -118,6 +135,23 @@ class InMemoryKeyValueDBTransaction : IKeyValueDBTransaction
 
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+
+        var reused1 = Reused1;
+        Reused1 = null;
+        if (reused1 != null)
+        {
+            ((InMemoryKeyValueDBCursor)reused1).RealDispose(this);
+        }
+
+        var reused2 = Reused2;
+        Reused2 = null;
+        if (reused2 != null)
+        {
+            ((InMemoryKeyValueDBCursor)reused2).RealDispose(this);
+        }
+
         if (_writing || _preapprovedWriting)
         {
             _keyValueDB.RevertWritingTransaction();

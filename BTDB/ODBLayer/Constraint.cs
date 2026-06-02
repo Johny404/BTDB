@@ -1,10 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using BTDB.Collections;
 using BTDB.FieldHandler;
 using BTDB.IL;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
 
 namespace BTDB.ODBLayer;
@@ -145,10 +146,46 @@ public abstract class Constraint<T> : IConstraint
                 Any = new ConstraintNotImplemented<T>();
             }
         }
+        else if (typeof(T) == typeof(List<string>) || typeof(T) == typeof(IList<string>))
+        {
+            Any = new ConstraintListStringAny<T>();
+        }
+        else if (typeof(T) == typeof(List<ulong>) || typeof(T) == typeof(IList<ulong>))
+        {
+            Any = new ConstraintListUlongAny<T>();
+        }
         else
         {
             Any = new ConstraintNotImplemented<T>();
         }
+    }
+}
+
+public class ConstraintListStringAny<T> : ConstraintAny<T>
+{
+    public override IConstraint.MatchResult Match(ref MemReader reader, in MemWriter buffer)
+    {
+        var count = reader.ReadVUInt32();
+        for (var i = 0; i < count; i++)
+        {
+            reader.SkipString();
+        }
+
+        return IConstraint.MatchResult.Yes;
+    }
+}
+
+public class ConstraintListUlongAny<T> : ConstraintAny<T>
+{
+    public override IConstraint.MatchResult Match(ref MemReader reader, in MemWriter buffer)
+    {
+        var count = reader.ReadVUInt32();
+        for (var i = 0; i < count; i++)
+        {
+            reader.SkipVUInt64();
+        }
+
+        return IConstraint.MatchResult.Yes;
     }
 }
 
@@ -457,6 +494,15 @@ public static partial class Constraint
         }
     }
 
+    public static partial class NullableDateTime
+    {
+        public static Constraint<System.DateTime?> Predicate(Predicate<System.DateTime?> predicate) =>
+            new ConstraintNullableDateTimePredicate(predicate);
+
+        public static Constraint<System.DateTime?> UpTo(System.DateTime value, bool including = true) =>
+            new ConstraintNullableDateTimeUpTo(DateTime.ForbidUnspecifiedKind(value), including);
+    }
+
     public static partial class Unsigned
     {
         public static Constraint<ulong> Exact(ulong value) => new ConstraintUnsignedExact(value);
@@ -486,47 +532,9 @@ public static partial class Constraint
     public static partial class Enum<T> where T : Enum
     {
         public static readonly bool IsSigned = SignedFieldHandler.IsCompatibleWith(typeof(T).GetEnumUnderlyingType());
-        public static readonly Func<T, long>? ToLong;
-        public static readonly Func<long, T>? FromLong;
-        public static readonly Func<T, ulong>? ToUlong;
-        public static readonly Func<ulong, T>? FromUlong;
-
-        static Enum()
-        {
-            if (IsSigned)
-            {
-                var b = ILBuilder.Instance.NewMethod<Func<T, long>>("ToLong" + typeof(T).FullName);
-                b.Generator
-                    .Ldarg(0)
-                    .ConvI8()
-                    .Ret();
-                ToLong = b.Create();
-                var b2 = ILBuilder.Instance.NewMethod<Func<long, T>>("FromLong" + typeof(T).FullName);
-                b2.Generator.Ldarg(0);
-                DefaultTypeConvertorGenerator.Instance.GenerateConversion(typeof(long),
-                    typeof(T).GetEnumUnderlyingType())!(b2.Generator);
-                b2.Generator.Ret();
-                FromLong = b2.Create();
-            }
-            else
-            {
-                var b = ILBuilder.Instance.NewMethod<Func<T, ulong>>("ToUlong" + typeof(T).FullName);
-                b.Generator
-                    .Ldarg(0)
-                    .ConvU8()
-                    .Ret();
-                ToUlong = b.Create();
-                var b2 = ILBuilder.Instance.NewMethod<Func<ulong, T>>("FromUlong" + typeof(T).FullName);
-                b2.Generator.Ldarg(0);
-                DefaultTypeConvertorGenerator.Instance.GenerateConversion(typeof(ulong),
-                    typeof(T).GetEnumUnderlyingType())!(b2.Generator);
-                b2.Generator.Ret();
-                FromUlong = b2.Create();
-            }
-        }
 
         public static Constraint<T> Exact(T value) =>
-            IsSigned ? new ConstraintSignedEnumExact<T>(value) : new ConstraintUnsignedEnumExact<T>(value);
+            IsSigned ? new ConstraintSignedEnumExact<T>(ref value) : new ConstraintUnsignedEnumExact<T>(ref value);
 
         public static Constraint<T> Predicate(Predicate<T> predicate) =>
             IsSigned
@@ -569,9 +577,119 @@ public static partial class Constraint
         public static readonly Constraint<string> Any = Constraint<string>.Any;
     }
 
+    public static partial class ListString
+    {
+        public static Constraint<List<string>> Contains(string value) => new ConstraintListStringContains(value);
+    }
+
+    public static partial class ListUlong
+    {
+        public static Constraint<List<ulong>> StartsWith(ulong value) =>
+            new ConstraintListUlongStartsWith(value);
+    }
+
     public static partial class Guid
     {
         public static Constraint<System.Guid> Exact(System.Guid value) => new ConstraintGuidExact(value);
+    }
+}
+
+public class ConstraintListUlongStartsWith : Constraint<List<ulong>>
+{
+    readonly ulong _value;
+    int _ofs;
+    int _len;
+
+    public ConstraintListUlongStartsWith(ulong value)
+    {
+        _value = value;
+    }
+
+    public override bool IsSimpleExact() => false;
+
+    public override IConstraint.MatchType Prepare(ref MemWriter buffer)
+    {
+        _ofs = (int)buffer.GetCurrentPosition();
+        buffer.WriteVUInt64(_value);
+        _len = (int)buffer.GetCurrentPosition() - _ofs;
+        return IConstraint.MatchType.NoPrefix;
+    }
+
+    public override void WritePrefix(ref MemWriter writer, in MemWriter buffer)
+    {
+    }
+
+    public override IConstraint.MatchResult MatchLast(ref MemReader reader, in MemWriter buffer)
+    {
+        var count = reader.ReadVUInt32();
+        if (count == 0) return IConstraint.MatchResult.No;
+        var val = buffer.AsReadOnlySpan(_ofs, _len);
+        return reader.CheckMagic(val) ? IConstraint.MatchResult.Yes : IConstraint.MatchResult.No;
+    }
+
+    public override IConstraint.MatchResult Match(ref MemReader reader, in MemWriter buffer)
+    {
+        var res = false;
+        var count = reader.ReadVUInt32();
+        if (count == 0) return IConstraint.MatchResult.No;
+        var val = buffer.AsReadOnlySpan(_ofs, _len);
+        if (reader.CheckMagic(val))
+        {
+            res = true;
+        }
+        else
+        {
+            reader.SkipVUInt64();
+        }
+
+        for (var i = 1; i < count; i++)
+        {
+            reader.SkipVUInt64();
+        }
+
+        return res ? IConstraint.MatchResult.Yes : IConstraint.MatchResult.No;
+    }
+}
+
+public class ConstraintListStringContains : Constraint<List<string>>
+{
+    readonly string _value;
+    int _ofs;
+    int _len;
+
+    public ConstraintListStringContains(string value)
+    {
+        _value = value;
+    }
+
+    public override bool IsSimpleExact() => false;
+
+    public override IConstraint.MatchType Prepare(ref MemWriter buffer)
+    {
+        _ofs = (int)buffer.GetCurrentPosition();
+        buffer.WriteString(_value);
+        _len = (int)buffer.GetCurrentPosition() - _ofs;
+        return IConstraint.MatchType.NoPrefix;
+    }
+
+    public override void WritePrefix(ref MemWriter writer, in MemWriter buffer)
+    {
+    }
+
+    public override IConstraint.MatchResult Match(ref MemReader reader, in MemWriter buffer)
+    {
+        var res = false;
+        var count = reader.ReadVUInt32();
+        var val = buffer.AsReadOnlySpan(_ofs, _len);
+        for (var i = 0; i < count; i++)
+        {
+            if (reader.CheckMagic(val))
+                res = true;
+            else
+                reader.SkipString();
+        }
+
+        return res ? IConstraint.MatchResult.Yes : IConstraint.MatchResult.No;
     }
 }
 
@@ -801,6 +919,58 @@ public class ConstraintDateTimePredicate : ConstraintNoPrefix<DateTime>
 
     public override IConstraint.MatchResult Match(ref MemReader reader, in MemWriter buffer) =>
         AsMatchResult(_predicate(reader.ReadDateTime()));
+}
+
+public class ConstraintNullableDateTimePredicate : ConstraintNoPrefix<DateTime?>
+{
+    readonly Predicate<DateTime?> _predicate;
+
+    public ConstraintNullableDateTimePredicate(Predicate<DateTime?> predicate) => _predicate = predicate;
+
+    public override IConstraint.MatchResult Match(ref MemReader reader, in MemWriter buffer)
+    {
+        if (reader.ReadUInt8() == 0)
+        {
+            return AsMatchResult(_predicate(null));
+        }
+
+        return AsMatchResult(_predicate(reader.ReadDateTime()));
+    }
+}
+
+public class ConstraintNullableDateTimeUpTo : Constraint<DateTime?>
+{
+    readonly ConstraintDateTimeUpTo _upTo;
+
+    public ConstraintNullableDateTimeUpTo(DateTime value, bool including)
+    {
+        _upTo = new ConstraintDateTimeUpTo(value, including);
+    }
+
+    public override bool IsSimpleExact() => false;
+
+    public override IConstraint.MatchType Prepare(ref MemWriter buffer)
+    {
+        _upTo.Prepare(ref buffer);
+        return IConstraint.MatchType.Prefix;
+    }
+
+    public override void WritePrefix(ref MemWriter writer, in MemWriter buffer)
+    {
+        writer.WriteUInt8(1);
+    }
+
+    public override IConstraint.MatchResult Match(ref MemReader reader, in MemWriter buffer)
+    {
+        if (reader.ReadUInt8() != 1) return IConstraint.MatchResult.No;
+        return _upTo.Match(ref reader, buffer);
+    }
+
+    public override IConstraint.MatchResult MatchLast(ref MemReader reader, in MemWriter buffer)
+    {
+        if (reader.ReadUInt8() != 1) return IConstraint.MatchResult.No;
+        return _upTo.MatchLast(ref reader, buffer);
+    }
 }
 
 public abstract class ConstraintExact<T> : Constraint<T>
@@ -1171,7 +1341,11 @@ public class ConstraintSignedEnumExact<T> : ConstraintExact<T> where T : Enum
 {
     readonly long _value;
 
-    public ConstraintSignedEnumExact(T value) => _value = Constraint.Enum<T>.ToLong!(value);
+    public ConstraintSignedEnumExact(ref T value)
+    {
+        DefaultTypeConverterFactory.Instance.GetConverter(typeof(T), typeof(long))!.Invoke(
+            ref Unsafe.As<T, byte>(ref value), ref Unsafe.As<long, byte>(ref _value));
+    }
 
     protected override void WriteExactValue(ref MemWriter writer)
     {
@@ -1188,7 +1362,11 @@ public class ConstraintUnsignedEnumExact<T> : ConstraintExact<T> where T : Enum
 {
     readonly ulong _value;
 
-    public ConstraintUnsignedEnumExact(T value) => _value = Constraint.Enum<T>.ToUlong!(value);
+    public ConstraintUnsignedEnumExact(ref T value)
+    {
+        DefaultTypeConverterFactory.Instance.GetConverter(typeof(T), typeof(ulong))!.Invoke(
+            ref Unsafe.As<T, byte>(ref value), ref Unsafe.As<ulong, byte>(ref _value));
+    }
 
     protected override void WriteExactValue(ref MemWriter writer)
     {
@@ -1222,19 +1400,31 @@ public class ConstraintUnsignedAny<T> : ConstraintAny<T>
 public class ConstraintSignedEnumPredicate<T> : ConstraintNoPrefix<T> where T : Enum
 {
     readonly Predicate<T> _predicate;
+    static readonly Converter Long2T = DefaultTypeConverterFactory.Instance.GetConverter(typeof(long), typeof(T))!;
 
     public ConstraintSignedEnumPredicate(Predicate<T> predicate) => _predicate = predicate;
 
-    public override IConstraint.MatchResult Match(ref MemReader reader, in MemWriter buffer) =>
-        AsMatchResult(_predicate(Constraint.Enum<T>.FromLong!(reader.ReadVInt64())));
+    public override IConstraint.MatchResult Match(ref MemReader reader, in MemWriter buffer)
+    {
+        T enumValue = default;
+        var value = reader.ReadVInt64();
+        Long2T(ref Unsafe.As<long, byte>(ref value), ref Unsafe.As<T, byte>(ref enumValue));
+        return AsMatchResult(_predicate(enumValue));
+    }
 }
 
 public class ConstraintUnsignedEnumPredicate<T> : ConstraintNoPrefix<T> where T : Enum
 {
     readonly Predicate<T> _predicate;
+    static readonly Converter Ulong2T = DefaultTypeConverterFactory.Instance.GetConverter(typeof(ulong), typeof(T))!;
 
     public ConstraintUnsignedEnumPredicate(Predicate<T> predicate) => _predicate = predicate;
 
-    public override IConstraint.MatchResult Match(ref MemReader reader, in MemWriter buffer) =>
-        AsMatchResult(_predicate(Constraint.Enum<T>.FromUlong!(reader.ReadVUInt64())));
+    public override IConstraint.MatchResult Match(ref MemReader reader, in MemWriter buffer)
+    {
+        T enumValue = default;
+        var value = reader.ReadVUInt64();
+        Ulong2T(ref Unsafe.As<ulong, byte>(ref value), ref Unsafe.As<T, byte>(ref enumValue));
+        return AsMatchResult(_predicate(enumValue));
+    }
 }

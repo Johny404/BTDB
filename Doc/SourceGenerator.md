@@ -2,6 +2,31 @@
 
 ## IOC Container
 
+BTDB IOC can also be exposed through `Microsoft.Extensions.DependencyInjection`.
+The supported modes are standalone BTDB IOC, BTDB IOC with fallback into `ContainerBuilder.ServiceCollection`, and
+full bidirectional integration via `UseBtdbIoc(...)`.
+In ASP.NET Core Minimal API, call `builder.Services.UseBtdbIoc(containerBuilder)` and BTDB registrations become
+available as normal DI services, including endpoint parameters.
+When code needs the BTDB root container from the ASP.NET root `IServiceProvider`, resolve `IRootContainer`; scoped
+code should keep using `IContainer`.
+
+```csharp
+using BTDB.IOC;
+
+var builder = WebApplication.CreateBuilder(args);
+
+var containerBuilder = new ContainerBuilder();
+containerBuilder.RegisterType<MyService>().As<IMyService>().SingleInstance();
+
+builder.Services.UseBtdbIoc(containerBuilder);
+
+var app = builder.Build();
+
+app.MapGet("/hello", (IMyService service) => service.Hello());
+
+app.Run();
+```
+
 ### Classes
 
 BTDB IOC Container needs Factories for all types that should be constructable.
@@ -34,13 +59,28 @@ public class MyService : IMyService
 }
 ```
 
-All injectable properties must be marked by `[Dependency]` attribute.
+You can customize resolved parameter name by `[Dependency("name")]` attribute or by
+Microsoft.Extensions.DependencyInjection.FromKeyedServices attribute.
+
+```csharp
+[Generate]
+public class MyService
+{
+    public MyService([Dependency("key1")] int a, [Microsoft.Extensions.DependencyInjection.FromKeyedServices("key2")] string b)
+    {
+    }
+}
+```
+
+All injectable properties or fields must be marked by `[Dependency]` attribute.
 
 ```csharp
 internal class MyService : IMyService
 {
     [Dependency]
     internal ILogger Logger { get; init; }
+    [Dependency]
+    internal ILooger Logger2;
 }
 ```
 
@@ -59,6 +99,12 @@ public delegate IMyService Factory(int a);
 If you want to make Func<...> resolvable just declare new delegate with same signature and mark it by `[Generate]`
 attribute.
 It means that previous example also allows to use `Func<int, IMyService>`.
+
+```csharp
+[Generate]
+
+
+```
 
 ### How to generate for specific generic type instance
 

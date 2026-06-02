@@ -3,10 +3,12 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Security.Principal;
+using BTDB;
 using BTDB.Collections;
 using BTDB.FieldHandler;
 using BTDB.KVDBLayer;
 using BTDB.ODBLayer;
+using BTDB.Serialization;
 using Xunit;
 
 namespace BTDBTest;
@@ -230,7 +232,7 @@ public class ObjectDbTableUpgradeTest : IDisposable
     }
 
     [Fact]
-    public void UpgradePrimaryKeyWithIncompatibleEnumNotWork()
+    public void UpgradePrimaryKeyEvenWithIncompatibleEnumsDoesWork()
     {
         using (var tr = _db.StartTransaction())
         {
@@ -245,9 +247,10 @@ public class ObjectDbTableUpgradeTest : IDisposable
         ReopenDb();
         using (var tr = _db.StartTransaction())
         {
-            var ex = Assert.Throws<BTDBException>(() =>
-                tr.InitRelation<ITableWithEnumInKeyV3>("EnumWithItemInKeyIncompatible"));
-            Assert.Contains("Field 'Key'", ex.Message);
+            var creator = tr.InitRelation<ITableWithEnumInKeyV3>("EnumWithItemInKeyIncompatible");
+            var table = creator(tr);
+            Assert.Single(table);
+            Assert.Equal(1, (int)table.First().Key);
         }
     }
 
@@ -328,7 +331,7 @@ public class ObjectDbTableUpgradeTest : IDisposable
             var creator = tr.InitRelation<IJobTable3>("Job");
             var jobTable = creator(tr);
             jobTable.RemoveById(11);
-            Assert.Equal(0, jobTable.Count);
+            Assert.Empty(jobTable);
         }
     }
 
@@ -380,7 +383,7 @@ public class ObjectDbTableUpgradeTest : IDisposable
             var jobTable = creator(tr);
             jobTable.RemoveById(11);
 
-            Assert.Equal(1, jobTable.Count);
+            Assert.Single(jobTable);
 
             Assert.Null(jobTable.FindByExpiredStatusOrDefault(false, 300));
 
@@ -453,6 +456,28 @@ public class ObjectDbTableUpgradeTest : IDisposable
     {
     }
 
+    public class OdbEnumsInKeys1
+    {
+        [PrimaryKey(1)] public ulong Id { get; set; }
+
+        public IDictionary<SimpleEnum, int>? E { get; set; }
+    }
+
+    public interface IOdbEnumsInKeys1Table : IRelation<OdbEnumsInKeys1>
+    {
+    }
+
+    public class OdbEnumsInKeys2
+    {
+        [PrimaryKey(1)] public ulong Id { get; set; }
+
+        public Dictionary<SimpleEnumV3, int>? E { get; set; }
+    }
+
+    public interface IOdbEnumsInKeys2Table : IRelation<OdbEnumsInKeys2>
+    {
+    }
+
     [Fact]
     public void EnumsInDictionaryKeysIncompatibleUpgradeDoesNotWorkButAtLeastReportProblem()
     {
@@ -471,8 +496,8 @@ public class ObjectDbTableUpgradeTest : IDisposable
         {
             var creator = tr.InitRelation<IEnumsInKeys2Table>("Enums");
             var eTable = creator(tr);
-            Assert.Null(eTable.First().E);
-            Assert.Equal(1, eTable.Count);
+            Assert.NotNull(eTable.First().E);
+            Assert.Single(eTable);
             var e = new EnumsInKeys2 { Id = 1, E = new Dictionary<SimpleEnumV3, int> { { SimpleEnumV3.Four, 1 } } };
             eTable.Upsert(e);
             tr.Commit();
@@ -484,7 +509,44 @@ public class ObjectDbTableUpgradeTest : IDisposable
         {
             var creator = tr.InitRelation<IEnumsInKeys1Table>("Enums");
             var eTable = creator(tr);
-            Assert.Equal(1, eTable.Count);
+            Assert.Single(eTable);
+        }
+
+        ApproveFieldHandlerLoggerMessages();
+    }
+
+    [Fact]
+    public void OdbDictionaryToDictionaryIncompatibleUpgradeReportsHandlerTypes()
+    {
+        using (var tr = _db.StartTransaction())
+        {
+            var creator = tr.InitRelation<IOdbEnumsInKeys1Table>("Enums");
+            var eTable = creator(tr);
+            var e = new OdbEnumsInKeys1 { Id = 1, E = new Dictionary<SimpleEnum, int> { { SimpleEnum.One, 1 } } };
+            eTable.Upsert(e);
+            tr.Commit();
+        }
+
+        ReopenDb();
+
+        using (var tr = _db.StartTransaction())
+        {
+            var creator = tr.InitRelation<IOdbEnumsInKeys2Table>("Enums");
+            var eTable = creator(tr);
+            Assert.Single(eTable);
+            Assert.Null(eTable.First().E);
+            var e = new OdbEnumsInKeys2 { Id = 1, E = new Dictionary<SimpleEnumV3, int> { { SimpleEnumV3.Four, 1 } } };
+            eTable.Upsert(e);
+            tr.Commit();
+        }
+
+        ReopenDb();
+
+        using (var tr = _db.StartTransaction())
+        {
+            var creator = tr.InitRelation<IOdbEnumsInKeys1Table>("Enums");
+            var eTable = creator(tr);
+            Assert.Single(eTable);
         }
 
         ApproveFieldHandlerLoggerMessages();
@@ -530,7 +592,7 @@ public class ObjectDbTableUpgradeTest : IDisposable
         {
             var creator = tr.InitRelation<IDateTimeV2Table>("T");
             var table = creator(tr);
-            Assert.Equal(1, table.Count);
+            Assert.Single(table);
 
             Assert.True(table.First().Modified.HasValue);
             Assert.Equal(new(2000, 1, 1), table.First().Modified!.Value);
@@ -587,7 +649,7 @@ public class ObjectDbTableUpgradeTest : IDisposable
         {
             var creator = tr.InitRelation<IDictV2Table>("T");
             var table = creator(tr);
-            Assert.Equal(1, table.Count);
+            Assert.Single(table);
 
             Assert.Equal(2, table.First().D.Count);
             Assert.Equal(1, table.First().D[g1].Num);
@@ -661,7 +723,7 @@ public class ObjectDbTableUpgradeTest : IDisposable
         {
             var creator = tr.InitRelation<IRowObjWithDictV2Table>("T");
             var table = creator(tr);
-            Assert.Equal(1, table.Count);
+            Assert.Single(table);
 
             Assert.Equal(2, table.First().Obj.D.Count);
             Assert.Equal(1, table.First().Obj.D[g1].Num);
@@ -728,7 +790,7 @@ public class ObjectDbTableUpgradeTest : IDisposable
         {
             var creator = tr.InitRelation<IRowObjInObjV2Table>("T");
             var table = creator(tr);
-            Assert.Equal(1, table.Count);
+            Assert.Single(table);
             Assert.NotNull(table.First());
         }
     }
@@ -816,10 +878,10 @@ public class ObjectDbTableUpgradeTest : IDisposable
             var creator = tr.InitRelation<IS1RowObjWithListV2Table>("T");
             var table = creator(tr);
             table.RemoveById(2);
-            Assert.Equal(1, table.Count);
+            Assert.Single(table);
 
-            Assert.Equal(1, table.First().L.Count);
-            Assert.Equal(1, table.First().L[0].D.Count);
+            Assert.Single(table.First().L);
+            Assert.Single(table.First().L[0].D);
             Assert.Equal(1, table.First().L[0].D[1].Num);
             table.Upsert(table.First());
             // Assert no leaks in IDictionaries
@@ -863,6 +925,14 @@ public class ObjectDbTableUpgradeTest : IDisposable
         public static ObjChild Convert2ObjChild(Obj value) => new() { Num = value.Num, Child = 42 };
     }
 
+    public class MyObjToObjChildTypeConverterFactory : DefaultTypeConverterFactory
+    {
+        public MyObjToObjChildTypeConverterFactory()
+        {
+            RegisterConverter<Obj, ObjChild>((in fromI, out toI) => { toI = new() { Num = fromI.Num, Child = 42 }; });
+        }
+    }
+
     [Fact]
     public void InlineChildObjPreserveDataWithCustomConvertor()
     {
@@ -881,13 +951,14 @@ public class ObjectDbTableUpgradeTest : IDisposable
         ReopenDb();
 
         _db.TypeConvertorGenerator = new MyObjToObjChildTypeConvertorGenerator();
+        _db.TypeConverterFactory = new MyObjToObjChildTypeConverterFactory();
         _db.RegisterType(typeof(Obj));
         _db.RegisterType(typeof(ObjChild));
         using (var tr = _db.StartTransaction())
         {
             var creator = tr.InitRelation<IS2ObjV2Table>("T");
             var table = creator(tr);
-            Assert.Equal(1, table.Count);
+            Assert.Single(table);
 
             Assert.Equal(2, table.First().O.Num);
             Assert.Equal(42, table.First().O.Child);
@@ -1061,6 +1132,7 @@ public class ObjectDbTableUpgradeTest : IDisposable
         }
     }
 
+    [Generate]
     public interface IFace
     {
         int I { get; set; }
@@ -1111,6 +1183,47 @@ public class ObjectDbTableUpgradeTest : IDisposable
         {
             var t = tr.GetRelation<IRootObjTable>();
             Assert.Throws<BTDBException>(() => t.First());
+        }
+    }
+
+    public class JobV4
+    {
+        [PrimaryKey(1)] public ulong Id { get; set; }
+
+        [SecondaryKey("List", Order = 1)] public List<string> List { get; set; }
+
+        public string? Name { get; set; }
+    }
+
+    public interface IJobTable4 : IRelation<JobV4>
+    {
+        JobV4 FindByListOrDefault(List<string> list);
+    }
+
+    [Fact]
+    public void CanIntroduceNewListInUpgrade()
+    {
+        _db.RegisterType(typeof(JobV1), "Job");
+        using (var tr = _db.StartTransaction())
+        {
+            var creator = tr.InitRelation<IJobTable1>("Job");
+            var jobTable = creator(tr);
+            var job1 = new JobV1 { Id = 11, Name = "A" };
+            jobTable.Insert(job1);
+            tr.Commit();
+        }
+
+        ReopenDb();
+        _db.RegisterType(typeof(JobV4), "Job");
+
+        using (var tr = _db.StartTransaction())
+        {
+            var creator = tr.InitRelation<IJobTable4>("Job");
+            var jobTable = creator(tr);
+            Assert.Single(jobTable);
+
+            var j = jobTable.FindByListOrDefault([]);
+            Assert.Equal("A", j.Name);
         }
     }
 }

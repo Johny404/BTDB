@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using BTDB.IL;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
 
 namespace BTDB.FieldHandler;
@@ -140,6 +141,63 @@ public class NullableFieldHandler : IFieldHandler, IFieldHandlerWithNestedFieldH
         ilGenerator.Mark(finish);
     }
 
+    public FieldHandlerLoad Load(Type asType, ITypeConverterFactory typeConverterFactory)
+    {
+        var underlyingType = Nullable.GetUnderlyingType(asType);
+        if (underlyingType == null)
+        {
+            return this.BuildConvertingLoader(HandledType(), asType, typeConverterFactory);
+        }
+
+        var itemLoader = _itemHandler.Load(underlyingType, typeConverterFactory);
+        var offset = RawData.Align(1, RawData.GetSizeAndAlign(underlyingType).Align);
+
+        return (ref MemReader reader, IReaderCtx? ctx, ref byte value) =>
+        {
+            if (reader.ReadBool())
+            {
+                value = 1;
+                itemLoader(ref reader, ctx, ref Unsafe.AddByteOffset(ref value, offset));
+            }
+            else
+            {
+                value = 0;
+            }
+        };
+    }
+
+    public void Skip(ref MemReader reader, IReaderCtx? ctx)
+    {
+        if (reader.ReadBool())
+        {
+            _itemHandler.Skip(ref reader, ctx);
+        }
+    }
+
+    public FieldHandlerSave Save(Type asType, ITypeConverterFactory typeConverterFactory)
+    {
+        var underlyingType = Nullable.GetUnderlyingType(asType);
+        if (underlyingType == null)
+        {
+            return this.BuildConvertingSaver(asType, HandledType(), typeConverterFactory);
+        }
+
+        var itemSaver = _itemHandler.Save(underlyingType, typeConverterFactory);
+        var offset = RawData.Align(1, RawData.GetSizeAndAlign(underlyingType).Align);
+        return (ref MemWriter writer, IWriterCtx? ctx, ref byte value) =>
+        {
+            if (value != 0)
+            {
+                writer.WriteBool(true);
+                itemSaver(ref writer, ctx, ref Unsafe.AddByteOffset(ref value, offset));
+            }
+            else
+            {
+                writer.WriteBool(false);
+            }
+        };
+    }
+
     public IFieldHandler SpecializeLoadForType(Type type, IFieldHandler? typeHandler, IFieldHandlerLogger? logger)
     {
         if (_type == type) return this;
@@ -195,9 +253,16 @@ public class NullableFieldHandler : IFieldHandler, IFieldHandlerWithNestedFieldH
         yield return _itemHandler;
     }
 
-    public NeedsFreeContent FreeContent(IILGen ilGenerator, Action<IILGen> pushReader, Action<IILGen>? pushCtx)
+    public void FreeContent(ref MemReader reader, IReaderCtx? ctx)
     {
-        Skip(ilGenerator, pushReader, pushCtx);
-        return NeedsFreeContent.No;
+        if (reader.ReadBool())
+        {
+            _itemHandler.Skip(ref reader, ctx);
+        }
+    }
+
+    public bool DoesNeedFreeContent(HashSet<Type> visitedTypes)
+    {
+        return false;
     }
 }

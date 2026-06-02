@@ -9,8 +9,8 @@ using BTDB.Collections;
 using BTDB.FieldHandler;
 using BTDB.IL;
 using BTDB.KVDBLayer;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
-using Extensions = BTDB.FieldHandler.Extensions;
 
 namespace BTDB.ODBLayer;
 
@@ -39,7 +39,7 @@ public class TableInfo
     readonly ConcurrentDictionary<uint, ObjectLoader> _loaders = new();
     readonly ConcurrentDictionary<uint, ObjectLoader> _skippers = new();
 
-    readonly ConcurrentDictionary<uint, Tuple<NeedsFreeContent, ObjectFreeContent>> _freeContent = new();
+    readonly ConcurrentDictionary<uint, Tuple<bool, ObjectFreeContent>> _freeContent = new();
 
     readonly ConcurrentDictionary<uint, bool> _freeContentNeedDetectionInProgress = new();
 
@@ -267,46 +267,163 @@ public class TableInfo
         NeedStoreSingletonOid = false;
     }
 
-    void CreateSaver()
+    delegate void SaveFunc(object obj, ref MemWriter writer, IWriterCtx? ctx);
+
+    ref struct FieldSaverCtx
     {
-        var method = ILBuilder.Instance
-            .NewMethod<ObjectSaver>(
-                $"Saver_{Name}");
-        var ilGenerator = method.Generator;
-        ilGenerator.DeclareLocal(ClientType!);
-        ilGenerator
-            .Ldarg(3)
-            .Castclass(ClientType)
-            .Stloc(0);
+        internal nint StoragePtr;
+        internal object Object;
+        internal FieldHandlerSave Saver;
+        internal IWriterCtx? Ctx;
+        internal ref MemWriter Writer;
+        internal unsafe delegate*<object, ref byte, void> Getter;
+    }
+
+    unsafe void CreateSaver()
+    {
         var anyNeedsCtx = ClientTableVersionInfo!.NeedsCtx();
-        if (anyNeedsCtx)
+#pragma warning disable CS0162 // Unreachable code detected
+        if (IFieldHandler.UseNoEmit)
         {
-            ilGenerator.DeclareLocal(typeof(IWriterCtx));
-            ilGenerator
-                .Ldarg(0)
-                .Newobj(() => new DBWriterCtx(null))
-                .Stloc(1);
-        }
-
-        var props = ClientType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-        for (var i = 0; i < ClientTableVersionInfo.FieldCount; i++)
-        {
-            var field = ClientTableVersionInfo[i];
-            var getter = props.First(p => GetPersistentName(p) == field.Name).GetAnyGetMethod();
-            var handler = field.Handler!.SpecializeSaveForType(getter!.ReturnType);
-            var writerOrCtx = handler.NeedsCtx() ? (Action<IILGen>?)(il => il.Ldloc(1)) : null;
-            handler.Save(ilGenerator, il => il.Ldarg(2), writerOrCtx, il =>
+            var metadata = ReflectionMetadata.FindByType(ClientType!);
+            if (metadata == null)
+                throw new BTDBException("Type " + ClientType.ToSimpleName() + " does not have [Generate] attribute");
+            var savers = new SaveFunc[ClientTableVersionInfo.FieldCount];
+            for (var i = 0; i < ClientTableVersionInfo.FieldCount; i++)
             {
-                il.Ldloc(0).Callvirt(getter);
-                _tableInfoResolver.TypeConvertorGenerator.GenerateConversion(getter.ReturnType,
-                    handler.HandledType())!(il);
-            });
-        }
+                var field = ClientTableVersionInfo[i];
+                var fieldInfo = metadata.Fields.FirstOrDefault(p => p.Name == field.Name);
+                if (fieldInfo == null || fieldInfo.PropRefGetter == null && fieldInfo.ByteOffset == null)
+                {
+                    throw new InvalidOperationException($"Cannot get field metadata for {field.Name} in " +
+                                                        ClientType.ToSimpleName());
+                }
 
-        ilGenerator
-            .Ret();
-        var saver = method.Create();
-        Interlocked.CompareExchange(ref _saver, saver, null);
+                var saver = field.Handler!.Save(fieldInfo.Type,
+                    _tableInfoResolver.TypeConverterFactory);
+                if (fieldInfo.PropRefGetter == null)
+                {
+                    var offset = fieldInfo.ByteOffset!.Value;
+                    savers[i] = (obj, ref writer, ctx) => { saver(ref writer, ctx, ref RawData.Ref(obj, offset)); };
+                    continue;
+                }
+
+                var getter = fieldInfo.PropRefGetter;
+                if (!fieldInfo.Type.IsValueType)
+                {
+                    savers[i] = (obj, ref writer, ctx) =>
+                    {
+                        object? value = null;
+                        getter(obj, ref Unsafe.As<object, byte>(ref value));
+                        saver(ref writer, ctx, ref Unsafe.As<object, byte>(ref value));
+                    };
+                    continue;
+                }
+
+                if (!RawData.MethodTableOf(fieldInfo.Type).ContainsGCPointers &&
+                    RawData.GetSizeAndAlign(fieldInfo.Type).Size <= 16)
+                {
+                    savers[i] = (obj, ref writer, ctx) =>
+                    {
+                        Int128 value = 0;
+                        getter(obj, ref Unsafe.As<Int128, byte>(ref value));
+                        saver(ref writer, ctx, ref Unsafe.As<Int128, byte>(ref value));
+                    };
+                    continue;
+                }
+
+                var stackAllocator = ReflectionMetadata.FindStackAllocatorByType(fieldInfo.Type);
+                if (stackAllocator == null)
+                    throw new InvalidOperationException($"Cannot find stack allocator for {fieldInfo.Type}");
+                savers[i] = (obj, ref writer, ctx) =>
+                {
+                    var fieldSaverCtx = new FieldSaverCtx
+                    {
+                        Object = obj,
+                        Saver = saver,
+                        Getter = getter,
+                        Ctx = ctx,
+                        Writer = writer
+                    };
+
+                    stackAllocator(ref Unsafe.As<FieldSaverCtx, byte>(ref fieldSaverCtx),
+                        ref fieldSaverCtx.StoragePtr, &Nested);
+
+                    static void Nested(ref byte value)
+                    {
+                        ref var context = ref Unsafe.As<byte, FieldSaverCtx>(ref value);
+                        context.Getter(context.Object, ref Unsafe.AsRef<byte>((void*)context.StoragePtr));
+                        context.Saver(ref context.Writer, context.Ctx,
+                            ref Unsafe.AsRef<byte>((void*)context.StoragePtr));
+                    }
+                };
+            }
+
+            if (anyNeedsCtx)
+            {
+                var saver = (ObjectSaver)((transaction, _,
+                    ref writer, value) =>
+                {
+                    var ctx = new DBWriterCtx(transaction);
+                    foreach (var saver in savers)
+                    {
+                        saver(value, ref writer, ctx);
+                    }
+                });
+                Interlocked.CompareExchange(ref _saver, saver, null);
+            }
+            else
+            {
+                var saver = (ObjectSaver)((_, _,
+                    ref writer, value) =>
+                {
+                    foreach (var saver in savers)
+                    {
+                        saver(value, ref writer, null);
+                    }
+                });
+                Interlocked.CompareExchange(ref _saver, saver, null);
+            }
+        }
+        else
+        {
+            var method = ILBuilder.Instance.NewMethod<ObjectSaver>($"Saver_{Name}");
+            var ilGenerator = method.Generator;
+            ilGenerator.DeclareLocal(ClientType!);
+            ilGenerator
+                .Ldarg(3)
+                .Castclass(ClientType)
+                .Stloc(0);
+            if (anyNeedsCtx)
+            {
+                ilGenerator.DeclareLocal(typeof(IWriterCtx));
+                ilGenerator
+                    .Ldarg(0)
+                    .Newobj(() => new DBWriterCtx(null))
+                    .Stloc(1);
+            }
+
+            var props = ClientType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            for (var i = 0; i < ClientTableVersionInfo.FieldCount; i++)
+            {
+                var field = ClientTableVersionInfo[i];
+                var getter = props.First(p => GetPersistentName(p) == field.Name).GetAnyGetMethod();
+                var handler = field.Handler!.SpecializeSaveForType(getter!.ReturnType);
+                var writerOrCtx = handler.NeedsCtx() ? (Action<IILGen>?)(il => il.Ldloc(1)) : null;
+                handler.Save(ilGenerator, il => il.Ldarg(2), writerOrCtx, il =>
+                {
+                    il.Ldloc(0).Callvirt(getter);
+                    _tableInfoResolver.TypeConvertorGenerator.GenerateConversion(getter.ReturnType,
+                        handler.HandledType())!(il);
+                });
+            }
+
+            ilGenerator
+                .Ret();
+            var saver = method.Create();
+            Interlocked.CompareExchange(ref _saver, saver, null);
+        }
+#pragma warning restore CS0162 // Unreachable code detected
     }
 
     internal void EnsureClientTypeVersion()
@@ -382,110 +499,318 @@ public class TableInfo
         return _loaders.GetOrAdd(version, CreateLoader);
     }
 
-    ObjectLoader CreateLoader(uint version)
+    delegate void LoadFunc(object obj, ref MemReader reader, IReaderCtx? ctx);
+
+    ref struct FieldLoaderCtx
+    {
+        internal nint StoragePtr;
+        internal object Object;
+        internal FieldHandlerLoad Loader;
+        internal IReaderCtx? Ctx;
+        internal ref MemReader Reader;
+        internal unsafe delegate*<object, ref byte, void> Setter;
+        internal FieldHandlerInit Init;
+    }
+
+    unsafe ObjectLoader CreateLoader(uint version)
     {
         EnsureClientTypeVersion();
-        var method = ILBuilder.Instance
-            .NewMethod<ObjectLoader>(
-                $"Loader_{Name}_{version}");
-        var ilGenerator = method.Generator;
-        ilGenerator.DeclareLocal(ClientType!);
-        ilGenerator
-            .Ldarg(3)
-            .Castclass(ClientType)
-            .Stloc(0);
-        var tableVersionInfo = TableVersions.GetOrAdd(version,
-            (ver, tableInfo) =>
-                tableInfo._tableInfoResolver.LoadTableVersionInfo(tableInfo.Id, ver, tableInfo.Name), this);
+        var tableVersionInfo = TableVersions.GetOrAdd(version, static (ver, tableInfo) =>
+            tableInfo._tableInfoResolver.LoadTableVersionInfo(tableInfo.Id, ver, tableInfo.Name), this);
         var clientTableVersionInfo = ClientTableVersionInfo;
         var anyNeedsCtx = tableVersionInfo.NeedsCtx() || clientTableVersionInfo!.NeedsCtx();
-        if (anyNeedsCtx)
-        {
-            ilGenerator.DeclareLocal(typeof(IReaderCtx));
-            ilGenerator
-                .Ldarg(0)
-                .Newobj(() => new DBReaderCtx(null))
-                .Stloc(1);
-        }
 
-        var props = _clientType!.GetProperties(BindingFlags.Public | BindingFlags.NonPublic |
-                                               BindingFlags.Instance);
-        for (var fi = 0; fi < tableVersionInfo.FieldCount; fi++)
+#pragma warning disable CS0162 // Unreachable code detected
+        if (IFieldHandler.UseNoEmit)
         {
-            var srcFieldInfo = tableVersionInfo[fi];
-            var readerOrCtx = srcFieldInfo.Handler!.NeedsCtx() ? (Action<IILGen>?)(il => il.Ldloc(1)) : null;
-            var destFieldInfo = clientTableVersionInfo![srcFieldInfo.Name];
-            if (destFieldInfo != null)
+            var metadata = ReflectionMetadata.FindByType(ClientType!);
+            if (metadata == null)
+                throw new BTDBException("Type " + _clientType.ToSimpleName() + " does not have [Generate] attribute");
+            var fieldsMetadata = metadata.Fields;
+            var loaders = new StructList<LoadFunc>();
+            var setFields = new HashSet<string>();
+            for (var fi = 0; fi < tableVersionInfo.FieldCount; fi++)
             {
-                var fieldInfo = props.First(p => GetPersistentName(p) == destFieldInfo.Name).GetAnySetMethod();
-                if (fieldInfo == null)
+                var srcFieldInfo = tableVersionInfo[fi];
+                var destFieldInfo = clientTableVersionInfo![srcFieldInfo.Name];
+                if (destFieldInfo != null)
                 {
-                    throw new InvalidOperationException($"Cannot find setter for {destFieldInfo.Name}");
-                }
-
-                var fieldType = fieldInfo.GetParameters()[0].ParameterType;
-                var specializedSrcHandler =
-                    srcFieldInfo.Handler.SpecializeLoadForType(fieldType, destFieldInfo.Handler,
-                        _tableInfoResolver.FieldHandlerLogger);
-                var willLoad = specializedSrcHandler.HandledType();
-                var converterGenerator =
-                    _tableInfoResolver.TypeConvertorGenerator.GenerateConversion(willLoad, fieldType);
-                if (converterGenerator != null)
-                {
-                    if (willLoad != fieldType)
+                    setFields.Add(destFieldInfo.Name);
+                    var fieldInfo = fieldsMetadata.FirstOrDefault(p => p.Name == destFieldInfo.Name);
+                    if (fieldInfo == null || fieldInfo.PropRefSetter == null && fieldInfo.ByteOffset == null)
                     {
-                        specializedSrcHandler.Load(ilGenerator, il => il.Ldarg(2), readerOrCtx);
-                        converterGenerator(ilGenerator);
-                        var local = ilGenerator.DeclareLocal(fieldType);
-                        ilGenerator.Stloc(local).Ldloc(0).Ldloc(local);
-                    }
-                    else
-                    {
-                        ilGenerator.Ldloc(0);
-                        specializedSrcHandler.Load(ilGenerator, il => il.Ldarg(2), readerOrCtx);
+                        throw new InvalidOperationException($"Cannot field metadata for {destFieldInfo.Name} in " +
+                                                            _clientType.ToSimpleName());
                     }
 
-                    ilGenerator.Call(fieldInfo);
-                    continue;
+                    try
+                    {
+                        var handlerLoad =
+                            srcFieldInfo.Handler!.Load(fieldInfo.Type, _tableInfoResolver.TypeConverterFactory);
+                        if (fieldInfo.PropRefSetter == null)
+                        {
+                            var offset = fieldInfo.ByteOffset!.Value;
+                            loaders.Add((obj, ref reader, ctx) =>
+                            {
+                                handlerLoad(ref reader, ctx, ref RawData.Ref(obj, offset));
+                            });
+                            continue;
+                        }
+
+                        var propRefSetter = fieldInfo.PropRefSetter;
+                        if (!fieldInfo.Type.IsValueType)
+                        {
+                            loaders.Add((obj, ref reader, ctx) =>
+                            {
+                                object? value = null;
+                                handlerLoad(ref reader, ctx, ref Unsafe.As<object, byte>(ref value));
+                                propRefSetter(obj, ref Unsafe.As<object, byte>(ref value));
+                            });
+                            continue;
+                        }
+
+                        if (!RawData.MethodTableOf(fieldInfo.Type).ContainsGCPointers &&
+                            RawData.GetSizeAndAlign(fieldInfo.Type).Size <= 16)
+                        {
+                            loaders.Add((obj, ref reader, ctx) =>
+                            {
+                                Int128 value = 0;
+                                handlerLoad(ref reader, ctx, ref Unsafe.As<Int128, byte>(ref value));
+                                propRefSetter(obj, ref Unsafe.As<Int128, byte>(ref value));
+                            });
+                            continue;
+                        }
+
+                        var stackAllocator = ReflectionMetadata.FindStackAllocatorByType(fieldInfo.Type);
+                        loaders.Add((obj, ref reader, ctx) =>
+                        {
+                            FieldLoaderCtx fieldLoaderCtx = new FieldLoaderCtx()
+                            {
+                                Object = obj,
+                                Loader = handlerLoad,
+                                Setter = propRefSetter,
+                                Ctx = ctx,
+                                Reader = reader
+                            };
+
+                            stackAllocator(ref Unsafe.As<FieldLoaderCtx, byte>(ref fieldLoaderCtx),
+                                ref fieldLoaderCtx.StoragePtr, &Nested);
+
+                            static void Nested(ref byte value)
+                            {
+                                ref var context = ref Unsafe.As<byte, FieldLoaderCtx>(ref value);
+                                context.Loader(ref context.Reader, context.Ctx,
+                                    ref Unsafe.AsRef<byte>((void*)context.StoragePtr));
+                                context.Setter(context.Object, ref Unsafe.AsRef<byte>((void*)context.StoragePtr));
+                            }
+                        });
+
+                        continue;
+                    }
+                    catch (Exception)
+                    {
+                        _tableInfoResolver.FieldHandlerLogger?.ReportTypeIncompatibility(
+                            srcFieldInfo.Handler.HandledType(),
+                            srcFieldInfo.Handler, fieldInfo.Type, destFieldInfo.Handler);
+                    }
                 }
 
-                _tableInfoResolver.FieldHandlerLogger?.ReportTypeIncompatibility(willLoad,
-                    srcFieldInfo.Handler, fieldType, destFieldInfo.Handler);
+                var handler = srcFieldInfo.Handler!;
+                loaders.Add((_, ref reader, ctx) => { handler.Skip(ref reader, ctx); });
+                if (destFieldInfo != null) setFields.Remove(destFieldInfo.Name);
             }
 
-            srcFieldInfo.Handler.Skip(ilGenerator, il => il.Ldarg(2), readerOrCtx);
-        }
-
-        if (ClientTypeVersion != version)
-        {
             for (var fi = 0; fi < clientTableVersionInfo!.FieldCount; fi++)
             {
                 var srcFieldInfo = clientTableVersionInfo[fi];
-                var iFieldHandlerWithInit = srcFieldInfo.Handler as IFieldHandlerWithInit;
+                if (setFields.Contains(srcFieldInfo.Name)) continue;
+                var handler = srcFieldInfo.Handler!;
+                var iFieldHandlerWithInit = handler as IFieldHandlerWithInit;
                 if (iFieldHandlerWithInit == null) continue;
-                if (tableVersionInfo[srcFieldInfo.Name] != null) continue;
-                Action<IILGen> readerOrCtx;
-                if (srcFieldInfo.Handler.NeedsCtx())
-                    readerOrCtx = il => il.Ldloc(1);
-                else
-                    readerOrCtx = il => il.Ldnull();
-                var specializedSrcHandler = srcFieldInfo.Handler;
-                var willLoad = specializedSrcHandler.HandledType();
-                var setterMethod = props.First(p => GetPersistentName(p) == srcFieldInfo.Name).GetAnySetMethod();
-                var converterGenerator =
-                    _tableInfoResolver.TypeConvertorGenerator.GenerateConversion(willLoad,
-                        setterMethod!.GetParameters()[0].ParameterType);
-                if (converterGenerator == null) continue;
                 if (!iFieldHandlerWithInit.NeedInit()) continue;
-                ilGenerator.Ldloc(0);
-                iFieldHandlerWithInit.Init(ilGenerator, readerOrCtx);
-                converterGenerator(ilGenerator);
-                ilGenerator.Call(setterMethod);
-            }
-        }
+                var fieldInfo = fieldsMetadata.FirstOrDefault(p => p.Name == srcFieldInfo.Name);
+                if (fieldInfo == null)
+                {
+                    throw new InvalidOperationException($"Cannot field metadata for {srcFieldInfo.Name} in " +
+                                                        _clientType.ToSimpleName());
+                }
 
-        ilGenerator.Ret();
-        return method.Create();
+                var init = iFieldHandlerWithInit.Init();
+                var propRefSetter = fieldInfo.PropRefSetter;
+                if (propRefSetter == null)
+                {
+                    var offset = fieldInfo.ByteOffset.Value;
+                    loaders.Add((obj, ref _, ctx) => { init(ctx, ref RawData.Ref(obj, offset)); });
+                    continue;
+                }
+
+                if (!fieldInfo.Type.IsValueType)
+                {
+                    loaders.Add((obj, ref _, ctx) =>
+                    {
+                        object? value = null;
+                        init(ctx, ref Unsafe.As<object, byte>(ref value));
+                        propRefSetter(obj, ref Unsafe.As<object, byte>(ref value));
+                    });
+                    continue;
+                }
+
+                if (!RawData.MethodTableOf(fieldInfo.Type).ContainsGCPointers &&
+                    RawData.GetSizeAndAlign(fieldInfo.Type).Size <= 16)
+                {
+                    loaders.Add((obj, ref _, ctx) =>
+                    {
+                        Int128 value = 0;
+                        init(ctx, ref Unsafe.As<Int128, byte>(ref value));
+                        propRefSetter(obj, ref Unsafe.As<Int128, byte>(ref value));
+                    });
+                }
+
+                var stackAllocator = ReflectionMetadata.FindStackAllocatorByType(fieldInfo.Type);
+                loaders.Add((obj, ref _, ctx) =>
+                {
+                    FieldLoaderCtx fieldLoaderCtx = new FieldLoaderCtx()
+                    {
+                        Object = obj,
+                        Init = init,
+                        Setter = propRefSetter,
+                        Ctx = ctx,
+                        Reader = default
+                    };
+
+                    stackAllocator(ref Unsafe.As<FieldLoaderCtx, byte>(ref fieldLoaderCtx),
+                        ref fieldLoaderCtx.StoragePtr, &Nested);
+
+                    static void Nested(ref byte value)
+                    {
+                        ref var context = ref Unsafe.As<byte, FieldLoaderCtx>(ref value);
+                        context.Init(context.Ctx, ref Unsafe.AsRef<byte>((void*)context.StoragePtr));
+                        context.Setter(context.Object, ref Unsafe.AsRef<byte>((void*)context.StoragePtr));
+                    }
+                });
+            }
+
+            var loadersArray = loaders.ToArray();
+            if (anyNeedsCtx)
+            {
+                return (transaction, _, ref reader, value) =>
+                {
+                    var ctx = new DBReaderCtx(transaction);
+                    foreach (var loadFunc in loadersArray)
+                    {
+                        loadFunc(value, ref reader, ctx);
+                    }
+                };
+            }
+
+            return (_, _, ref reader, value) =>
+            {
+                foreach (var loadFunc in loadersArray)
+                {
+                    loadFunc(value, ref reader, null);
+                }
+            };
+        }
+        else
+        {
+            var method = ILBuilder.Instance
+                .NewMethod<ObjectLoader>(
+                    $"Loader_{Name}_{version}");
+            var ilGenerator = method.Generator;
+            ilGenerator.DeclareLocal(ClientType!);
+            ilGenerator
+                .Ldarg(3)
+                .Castclass(ClientType)
+                .Stloc(0);
+            if (anyNeedsCtx)
+            {
+                ilGenerator.DeclareLocal(typeof(IReaderCtx));
+                ilGenerator
+                    .Ldarg(0)
+                    .Newobj(() => new DBReaderCtx(null))
+                    .Stloc(1);
+            }
+
+            var props = _clientType!.GetProperties(BindingFlags.Public | BindingFlags.NonPublic |
+                                                   BindingFlags.Instance);
+            for (var fi = 0; fi < tableVersionInfo.FieldCount; fi++)
+            {
+                var srcFieldInfo = tableVersionInfo[fi];
+                var readerOrCtx = srcFieldInfo.Handler!.NeedsCtx() ? (Action<IILGen>?)(il => il.Ldloc(1)) : null;
+                var destFieldInfo = clientTableVersionInfo![srcFieldInfo.Name];
+                if (destFieldInfo != null)
+                {
+                    var fieldInfo = props.First(p => GetPersistentName(p) == destFieldInfo.Name).GetAnySetMethod();
+                    if (fieldInfo == null)
+                    {
+                        throw new InvalidOperationException($"Cannot find setter for {destFieldInfo.Name}");
+                    }
+
+                    var fieldType = fieldInfo.GetParameters()[0].ParameterType;
+                    var specializedSrcHandler =
+                        srcFieldInfo.Handler.SpecializeLoadForType(fieldType, destFieldInfo.Handler,
+                            _tableInfoResolver.FieldHandlerLogger);
+                    var willLoad = specializedSrcHandler.HandledType();
+                    var converterGenerator =
+                        _tableInfoResolver.TypeConvertorGenerator.GenerateConversion(willLoad, fieldType);
+                    if (converterGenerator != null)
+                    {
+                        if (willLoad != fieldType)
+                        {
+                            specializedSrcHandler.Load(ilGenerator, il => il.Ldarg(2), readerOrCtx);
+                            converterGenerator(ilGenerator);
+                            var local = ilGenerator.DeclareLocal(fieldType);
+                            ilGenerator.Stloc(local).Ldloc(0).Ldloc(local);
+                        }
+                        else
+                        {
+                            ilGenerator.Ldloc(0);
+                            specializedSrcHandler.Load(ilGenerator, il => il.Ldarg(2), readerOrCtx);
+                        }
+
+                        ilGenerator.Call(fieldInfo);
+                        continue;
+                    }
+
+                    _tableInfoResolver.FieldHandlerLogger?.ReportTypeIncompatibility(willLoad,
+                        srcFieldInfo.Handler, fieldType, destFieldInfo.Handler);
+                }
+
+                srcFieldInfo.Handler.Skip(ilGenerator, il => il.Ldarg(2), readerOrCtx);
+            }
+
+            if (ClientTypeVersion != version)
+            {
+                for (var fi = 0; fi < clientTableVersionInfo!.FieldCount; fi++)
+                {
+                    var srcFieldInfo = clientTableVersionInfo[fi];
+                    var iFieldHandlerWithInit = srcFieldInfo.Handler as IFieldHandlerWithInit;
+                    if (iFieldHandlerWithInit == null) continue;
+                    if (tableVersionInfo[srcFieldInfo.Name] != null) continue;
+                    Action<IILGen> readerOrCtx;
+                    if (srcFieldInfo.Handler.NeedsCtx())
+                        readerOrCtx = il => il.Ldloc(1);
+                    else
+                        readerOrCtx = il => il.Ldnull();
+                    var specializedSrcHandler = srcFieldInfo.Handler;
+                    var willLoad = specializedSrcHandler.HandledType();
+                    var setterMethod = props.First(p => GetPersistentName(p) == srcFieldInfo.Name).GetAnySetMethod();
+                    var converterGenerator =
+                        _tableInfoResolver.TypeConvertorGenerator.GenerateConversion(willLoad,
+                            setterMethod!.GetParameters()[0].ParameterType);
+                    if (converterGenerator == null) continue;
+                    if (!iFieldHandlerWithInit.NeedInit()) continue;
+                    ilGenerator.Ldloc(0);
+                    iFieldHandlerWithInit.Init(ilGenerator, readerOrCtx);
+                    converterGenerator(ilGenerator);
+                    ilGenerator.Call(setterMethod);
+                }
+            }
+
+            ilGenerator.Ret();
+            return method.Create();
+        }
+#pragma warning restore CS0162 // Unreachable code detected
     }
 
     internal ObjectLoader GetSkipper(uint version)
@@ -495,81 +820,89 @@ public class TableInfo
 
     ObjectLoader CreateSkipper(uint version)
     {
-        var method = ILBuilder.Instance
-            .NewMethod<ObjectLoader>(
-                $"Skipper_{Name}_{version}");
-        var ilGenerator = method.Generator;
         var tableVersionInfo = TableVersions.GetOrAdd(version, static (ver, tableInfo) =>
             tableInfo._tableInfoResolver.LoadTableVersionInfo(tableInfo.Id, ver, tableInfo.Name), this);
         var anyNeedsCtx = tableVersionInfo.NeedsCtx();
-        IILLocal? ctxLocal = null;
-        if (anyNeedsCtx)
-        {
-            ctxLocal = ilGenerator.DeclareLocal(typeof(IReaderCtx));
-            ilGenerator
-                .Ldarg(0)
-                .Newobj(() => new DBReaderCtx(null))
-                .Stloc(ctxLocal);
-        }
-
+        var handlers = new IFieldHandler[tableVersionInfo.FieldCount];
         for (var fi = 0; fi < tableVersionInfo.FieldCount; fi++)
         {
-            var srcFieldInfo = tableVersionInfo[fi];
-            var readerOrCtx = srcFieldInfo.Handler!.NeedsCtx() ? (Action<IILGen>?)(il => il.Ldloc(ctxLocal!)) : null;
-            srcFieldInfo.Handler.Skip(ilGenerator, il => il.Ldarg(2), readerOrCtx);
+            handlers[fi] = tableVersionInfo[fi].Handler;
         }
 
-        ilGenerator.Ret();
-        return method.Create();
+        if (anyNeedsCtx)
+        {
+            return (transaction, _, ref reader, _) =>
+            {
+                var ctx = new DBReaderCtx(transaction);
+                foreach (var handler in handlers)
+                {
+                    handler.Skip(ref reader, ctx);
+                }
+            };
+        }
+
+        return (_, _, ref reader, _) =>
+        {
+            foreach (var handler in handlers)
+            {
+                handler.Skip(ref reader, null);
+            }
+        };
     }
 
-    internal NeedsFreeContent IsFreeContentNeeded(uint version)
+    internal bool IsFreeContentNeeded(uint version)
     {
-        if (_freeContentRequired) return NeedsFreeContent.Yes;
+        if (_freeContentRequired) return true;
         if (_freeContent.TryGetValue(version, out var freeContent))
             return freeContent.Item1;
         if (_freeContentNeedDetectionInProgress.ContainsKey(version))
-            return NeedsFreeContent.No; //if needed is reported by the other detection in progress
+            return false; //if needed is reported by the other detection in progress
         _freeContentNeedDetectionInProgress[version] = true;
         var result = GetFreeContent(version).Item1;
         _freeContentNeedDetectionInProgress.TryRemove(version);
         return result;
     }
 
-    internal Tuple<NeedsFreeContent, ObjectFreeContent> GetFreeContent(uint version)
+    internal Tuple<bool, ObjectFreeContent> GetFreeContent(uint version)
     {
         return _freeContent.GetOrAdd(version, CreateFreeContent);
     }
 
-    Tuple<NeedsFreeContent, ObjectFreeContent> CreateFreeContent(uint version)
+    Tuple<bool, ObjectFreeContent> CreateFreeContent(uint version)
     {
-        var method = ILBuilder.Instance.NewMethod<ObjectFreeContent>($"FreeContent_{Name}_{version}");
-        var ilGenerator = method.Generator;
-        var tableVersionInfo = TableVersions.GetOrAdd(version,
-            (ver, tableInfo) =>
-                tableInfo._tableInfoResolver.LoadTableVersionInfo(tableInfo.Id, ver, tableInfo.Name), this);
-        var needsFreeContent = NeedsFreeContent.No;
+        var tableVersionInfo = TableVersions.GetOrAdd(version, static (ver, tableInfo) =>
+            tableInfo._tableInfoResolver.LoadTableVersionInfo(tableInfo.Id, ver, tableInfo.Name), this);
         var anyNeedsCtx = tableVersionInfo.NeedsCtx();
-        if (anyNeedsCtx)
-        {
-            ilGenerator.DeclareLocal(typeof(IReaderCtx));
-            ilGenerator
-                .Ldarg(0)
-                .Ldarg(3)
-                .Newobj(() => new DBReaderWithFreeInfoCtx(null, null))
-                .Stloc(0);
-        }
 
+        var doesNeedFreeContent = false;
+        var visitedTypes = new HashSet<Type>();
+        var handlerList = new List<IFieldHandler>();
         for (var fi = 0; fi < tableVersionInfo.FieldCount; fi++)
         {
             var srcFieldInfo = tableVersionInfo[fi];
-            Extensions.UpdateNeedsFreeContent(
-                srcFieldInfo.Handler!.FreeContent(ilGenerator, il => il.Ldarg(2), il => il.Ldloc(0)),
-                ref needsFreeContent);
+            doesNeedFreeContent |= srcFieldInfo.Handler!.DoesNeedFreeContent(visitedTypes);
+            handlerList.Add(srcFieldInfo.Handler);
         }
 
-        ilGenerator.Ret();
-        return Tuple.Create(needsFreeContent, method.Create());
+        var handlers = handlerList.ToArray();
+        return anyNeedsCtx
+            ? Tuple.Create(doesNeedFreeContent, (ObjectFreeContent)((transaction, metadata,
+                ref reader, dictIds) =>
+            {
+                var ctx = new DBReaderWithFreeInfoCtx(transaction, dictIds);
+                foreach (var handler in handlers)
+                {
+                    handler.FreeContent(ref reader, ctx);
+                }
+            }))
+            : Tuple.Create(doesNeedFreeContent, (ObjectFreeContent)((transaction, metadata,
+                ref reader, dictIds) =>
+            {
+                foreach (var handler in handlers)
+                {
+                    handler.FreeContent(ref reader, null);
+                }
+            }));
     }
 
     static string GetPersistentName(PropertyInfo p)

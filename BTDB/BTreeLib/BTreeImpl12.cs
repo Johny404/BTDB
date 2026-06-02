@@ -304,7 +304,8 @@ public class BTreeImpl12
         {
             if (ctx._afterFirst)
             {
-                if (ctx._cancellation.IsCancellationRequested || DateTime.UtcNow > ctx._operationTimeout)
+                if ((ctx._timeoutTestCounter++ & 15) == 0 && (ctx._cancellation.IsCancellationRequested ||
+                                                              DateTime.UtcNow > ctx._operationTimeout))
                 {
                     ctx._interrupted = true;
                     if (header.HasLongKeys)
@@ -2389,7 +2390,7 @@ public class BTreeImpl12
                     newValues[0] = _newChildNode;
                     newValues = newValues.Slice(2);
                     NodeUtils12.CopyAndReferenceBranchValues(oldValues.Slice(idx - splitPos + 1), newValues);
-                    stack[(uint)stackIdx].Set(newNode, (byte)(idx - splitPos + (rightInsert ? 1 : 0)));
+                    stack[(uint)stackIdx].Set(newNode2, (byte)(idx - splitPos + (rightInsert ? 1 : 0)));
                     NodeUtils12.RecalcRecursiveChildrenCount(newNode);
                     NodeUtils12.RecalcRecursiveChildrenCount(newNode2);
                     _newChildNode = newNode;
@@ -2585,7 +2586,7 @@ public class BTreeImpl12
         }
     }
 
-    internal static void FastIterate(int deepness, IntPtr top, ref StructList<CursorItem> stack, ref Span<byte> buffer,
+    internal static bool FastIterate(int deepness, IntPtr top, ref StructList<CursorItem> stack, ref Span<byte> buffer,
         ref long keyIndex, CursorIterateCallback callback)
     {
         if (deepness == stack.Count)
@@ -2617,7 +2618,11 @@ public class BTreeImpl12
                     }
 
                     key.CopyTo(buffer[prefixSpan.Length..]);
-                    callback.Invoke(keyIndex, buffer[..(prefixSpan.Length + key.Length)]);
+                    if (callback.Invoke(keyIndex, buffer[..(prefixSpan.Length + key.Length)]))
+                    {
+                        return true;
+                    }
+
                     keyIndex++;
                 }
             }
@@ -2639,7 +2644,11 @@ public class BTreeImpl12
                     }
 
                     key.CopyTo(buffer[prefixSpan.Length..]);
-                    callback.Invoke(keyIndex, buffer[..(prefixSpan.Length + key.Length)]);
+                    if (callback.Invoke(keyIndex, buffer[..(prefixSpan.Length + key.Length)]))
+                    {
+                        return true;
+                    }
+
                     keyIndex++;
                 }
             }
@@ -2649,11 +2658,15 @@ public class BTreeImpl12
             var children = NodeUtils12.GetBranchValuePtrs(top);
             for (var i = (int)stack[deepness]._posInNode; i < children.Length; i++, stack[deepness]._posInNode++)
             {
-                FastIterate(deepness + 1, children[i], ref stack, ref buffer, ref keyIndex, callback);
+                if (FastIterate(deepness + 1, children[i], ref stack, ref buffer, ref keyIndex, callback))
+                {
+                    return true;
+                }
             }
         }
 
         stack.Pop();
+        return false;
     }
 
     static int NewSize(int size, int existingSize)

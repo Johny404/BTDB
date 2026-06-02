@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Reflection;
 using BTDB.Collections;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace BTDB.IOC;
 
@@ -26,6 +27,12 @@ public class ContainerBuilder
     StructList<IRegistration> _registrations;
 
     readonly ContainerBuilderBehaviour _builderBehaviour;
+
+    ServiceCollection? _serviceCollection;
+    IServiceProvider? _externalServiceProvider;
+    ServiceProviderIntegration? _externalServiceProviderIntegration;
+
+    public ServiceCollection ServiceCollection => _serviceCollection ??= new();
 
     public ContainerBuilder(ContainerBuilderBehaviour builderBehaviour = ContainerBuilderBehaviour.None)
     {
@@ -105,10 +112,19 @@ public class ContainerBuilder
 
     public IRegistration<IAsLiveScopeScanTrait> RegisterAssemblyTypes(Assembly from)
     {
-        return RegisterAssemblyTypes(new[] { from });
+        var registration = new MultiRegistration(from);
+        _registrations.Add(registration);
+        return registration;
     }
 
     public IRegistration<IAsLiveScopeScanTrait> RegisterAssemblyTypes(params Assembly[] fromParams)
+    {
+        var registration = new MultiRegistration(fromParams);
+        _registrations.Add(registration);
+        return registration;
+    }
+
+    public IRegistration<IAsLiveScopeScanTrait> RegisterAssemblyTypes(ReadOnlySpan<Assembly> fromParams)
     {
         var registration = new MultiRegistration(fromParams);
         _registrations.Add(registration);
@@ -122,13 +138,68 @@ public class ContainerBuilder
         return registration;
     }
 
+    public IRegistration<IAsLiveScopeScanTrait> RegisterGeneric(Type openGenericClass)
+    {
+        var registration = new MultiRegistration();
+        registration.Where(type => type.IsGenericType && type.GetGenericTypeDefinition() == openGenericClass);
+        _registrations.Add(registration);
+        return registration;
+    }
+
     public IContainer Build()
     {
-        return new ContainerImpl(_registrations.AsReadOnlySpan(), ContainerVerification.AllTypesAreGenerated);
+        return Build(ContainerVerification.AllTypesAreGenerated);
     }
 
     public IContainer BuildAndVerify(ContainerVerification options = ContainerVerification.All)
     {
-        return new ContainerImpl(_registrations.AsReadOnlySpan(), options);
+        return Build(options);
+    }
+
+    IContainer Build(ContainerVerification options)
+    {
+        if (_externalServiceProvider != null)
+        {
+            return new ContainerImpl(_registrations.AsReadOnlySpan(), options, _externalServiceProvider,
+                _externalServiceProviderIntegration);
+        }
+
+        IServiceProvider? serviceProvider = null;
+        if (_serviceCollection is { Count: > 0 })
+        {
+            // Plain ContainerBuilder.ServiceCollection enables only BTDB -> MS.DI fallback.
+            // Exporting BTDB registrations back into MS.DI is reserved for UseBtdbIoc(...).
+            var serviceCollection = new ServiceCollection();
+            foreach (var descriptor in _serviceCollection)
+            {
+                ((System.Collections.Generic.ICollection<ServiceDescriptor>)serviceCollection).Add(descriptor);
+            }
+
+            serviceProvider = serviceCollection.BuildServiceProvider();
+        }
+
+        return new ContainerImpl(_registrations.AsReadOnlySpan(), options, serviceProvider, null);
+    }
+
+    internal ServiceCollectionRegistrationContext CollectServiceCollectionRegistrations()
+    {
+        var registrationContext = new ServiceCollectionRegistrationContext();
+        foreach (var registration in _registrations)
+        {
+            ((IContanerRegistration)registration).RegisterForServiceCollection(registrationContext);
+        }
+
+        return registrationContext;
+    }
+
+    internal ServiceCollection? GetServiceCollection()
+    {
+        return _serviceCollection;
+    }
+
+    internal void SetServiceProvider(IServiceProvider serviceProvider, ServiceProviderIntegration serviceProviderIntegration)
+    {
+        _externalServiceProvider = serviceProvider;
+        _externalServiceProviderIntegration = serviceProviderIntegration;
     }
 }

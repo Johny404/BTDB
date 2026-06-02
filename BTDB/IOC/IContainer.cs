@@ -1,11 +1,11 @@
 using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 
 namespace BTDB.IOC;
 
-public interface IContainer
+public interface IContainer : IAsyncDisposable
 {
+    IContainer CreateScope();
     object Resolve(Type type);
     object ResolveNamed(string name, Type type);
     object ResolveKeyed(object key, Type type);
@@ -24,6 +24,10 @@ public interface IContainer
     {
         FactoryRegistry[type.TypeHandle.Value] = factory;
     }
+}
+
+public interface IRootContainer : IContainer
+{
 }
 
 public interface IResolvingCtx

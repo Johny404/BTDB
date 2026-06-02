@@ -6,6 +6,7 @@ using System.Text;
 using BTDB.Collections;
 using BTDB.IL;
 using BTDB.Locks;
+using BTDB.ODBLayer;
 
 namespace BTDB.Serialization;
 
@@ -15,11 +16,34 @@ public static class ReflectionMetadata
     static readonly SpanByteNoRemoveDictionary<ClassMetadata> NameToMetadata = new();
 
     static readonly RefDictionary<nint, CollectionMetadata> CollectionToMetadata = new();
+    static readonly RefDictionary<nint, CollectionMetadata> CollectionToMetadataByElementType = new();
+
+    static readonly RefDictionary<nint, (Func<RelationInfo, Func<IObjectDBTransaction, IRelation>>, Type[])>
+        RelationCreators =
+            new();
 
     //value type is actually delegate*<ref byte, ref nint, delegate*<ref byte, void>, void> but C# does not support it so replaced by simple pointer
     static readonly RefDictionary<nint, nint> StackAllocators = new();
 
     static SeqLock _lock;
+
+    static unsafe ReflectionMetadata()
+    {
+        Register(new()
+        {
+            Type = typeof(object),
+            Name = "Object",
+            Namespace = "System",
+            Fields = [],
+            Creator = &CreateObject,
+            Implements = []
+        });
+    }
+
+    static object CreateObject()
+    {
+        return new object();
+    }
 
     public static ClassMetadata? FindByType(Type type)
     {
@@ -79,12 +103,25 @@ public static class ReflectionMetadata
         return null;
     }
 
+    public static CollectionMetadata? FindCollectionByElementType(Type elementType)
+    {
+        var handle = elementType.TypeHandle.Value;
+        if (CollectionToMetadataByElementType.TryGetValueSeqLock(handle, out var metadata, ref _lock))
+            return metadata;
+        return null;
+    }
+
     public static void RegisterCollection(CollectionMetadata metadata)
     {
         _lock.StartWrite();
         try
         {
             CollectionToMetadata.TryAdd(metadata.Type.TypeHandle.Value, metadata);
+            if (metadata.ElementValueType == null)
+            {
+                CollectionToMetadataByElementType.TryAdd(metadata.Type.GetGenericArguments()[0].TypeHandle.Value,
+                    metadata);
+            }
         }
         finally
         {
@@ -146,5 +183,31 @@ public static class ReflectionMetadata
 #pragma warning restore CS8500 // This takes the address of, gets the size of, or declares a pointer to a managed type
         chain(ref ctx);
         ptr = 0;
+    }
+
+    public static void RegisterRelation(Type type,
+        Func<RelationInfo, Func<IObjectDBTransaction, IRelation>> creator, Type[] loadTypes)
+    {
+        _lock.StartWrite();
+        try
+        {
+            RelationCreators.TryAdd(type.TypeHandle.Value, (creator, loadTypes));
+        }
+        finally
+        {
+            _lock.EndWrite();
+        }
+    }
+
+    public static (Func<RelationInfo, Func<IObjectDBTransaction, IRelation>>, Type[])?
+        FindRelationCreatorByType(Type type)
+    {
+        var handle = type.TypeHandle.Value;
+        if (RelationCreators.TryGetValueSeqLock(handle, out var creator, ref _lock))
+        {
+            return creator;
+        }
+
+        return null;
     }
 }

@@ -10,12 +10,25 @@ using BTDB.StreamLayer;
 
 namespace BTDB.ODBLayer;
 
-public class ODBSet<TKey> : IOrderedSet<TKey>, IQuerySizeDictionary<TKey>, IAmLazyDBObject
+public delegate void IterateItemFun(ref byte item);
+
+public interface IInternalODBSet
+{
+    ulong DictId { get; }
+
+    // Actually type is IEnumerable<TKey>, but I need it non-generic
+    void Upsert(IEnumerable? list);
+
+    int Count { get; }
+
+    void Iterate(IterateItemFun iterateItemFun);
+}
+
+public class ODBSet<TKey> : IOrderedSet<TKey>, IQuerySizeDictionary<TKey>, IInternalODBSet, IAmLazyDBObject
 {
     readonly IInternalObjectDBTransaction _tr;
-    readonly IFieldHandler _keyHandler;
-    readonly ReaderFun<TKey> _keyReader;
-    readonly WriterFun<TKey> _keyWriter;
+    readonly RefReaderFun _keyReader;
+    readonly RefWriterFun _keyWriter;
     readonly IKeyValueDBTransaction _keyValueTr;
     readonly ulong _id;
     readonly byte[] _prefix;
@@ -25,7 +38,6 @@ public class ODBSet<TKey> : IOrderedSet<TKey>, IQuerySizeDictionary<TKey>, IAmLa
     public ODBSet(IInternalObjectDBTransaction tr, ODBDictionaryConfiguration config, ulong id)
     {
         _tr = tr;
-        _keyHandler = config.KeyHandler;
         _id = id;
         var len = PackUnpack.LengthVUInt(id);
         var prefix = new byte[ObjectDB.AllDictionariesPrefixLen + len];
@@ -34,8 +46,8 @@ public class ODBSet<TKey> : IOrderedSet<TKey>, IQuerySizeDictionary<TKey>, IAmLa
             ref Unsafe.AddByteOffset(ref MemoryMarshal.GetReference(prefix.AsSpan()),
                 ObjectDB.AllDictionariesPrefixLen), id, len);
         _prefix = prefix;
-        _keyReader = ((ReaderFun<TKey>)config.KeyReader)!;
-        _keyWriter = ((WriterFun<TKey>)config.KeyWriter)!;
+        _keyReader = config.KeyReader!;
+        _keyWriter = config.KeyWriter!;
         _keyValueTr = _tr.KeyValueDBTransaction;
         _count = -1;
     }
@@ -183,6 +195,16 @@ public class ODBSet<TKey> : IOrderedSet<TKey>, IQuerySizeDictionary<TKey>, IAmLa
         }
     }
 
+    public void Iterate(IterateItemFun iterateItemFun)
+    {
+        using var cursor = _keyValueTr.CreateCursor();
+        while (cursor.FindNextKey(_prefix))
+        {
+            var key = CurrentToKey(cursor);
+            iterateItemFun(ref Unsafe.As<TKey, byte>(ref key));
+        }
+    }
+
     public bool IsReadOnly => false;
 
 
@@ -197,9 +219,7 @@ public class ODBSet<TKey> : IOrderedSet<TKey>, IQuerySizeDictionary<TKey>, IAmLa
     ReadOnlySpan<byte> KeyToByteArray(TKey key, ref MemWriter writer)
     {
         writer.WriteBlock(_prefix);
-        IWriterCtx ctx = null;
-        if (_keyHandler.NeedsCtx()) ctx = new DBWriterCtx(_tr);
-        _keyWriter(key, ref writer, ctx);
+        _keyWriter(ref writer, _tr, ref Unsafe.As<TKey, byte>(ref key));
         return writer.GetScopedSpanAndReset();
     }
 
@@ -208,13 +228,14 @@ public class ODBSet<TKey> : IOrderedSet<TKey>, IQuerySizeDictionary<TKey>, IAmLa
     {
         Span<byte> buffer = stackalloc byte[2048];
         var keySpan = cursor.GetKeySpan(ref buffer)[_prefix.Length..];
+        TKey result = default;
         fixed (byte* _ = keySpan)
         {
             var reader = MemReader.CreateFromPinnedSpan(keySpan);
-            IReaderCtx ctx = null;
-            if (_keyHandler.NeedsCtx()) ctx = new DBReaderCtx(_tr);
-            return _keyReader(ref reader, ctx);
+            _keyReader(ref reader, _tr, ref Unsafe.As<TKey, byte>(ref result));
         }
+
+        return result;
     }
 
     [SkipLocalsInit]
@@ -555,5 +576,26 @@ public class ODBSet<TKey> : IOrderedSet<TKey>, IQuerySizeDictionary<TKey>, IAmLa
     public IEnumerable<TKey> GetAdvancedEnumerator(AdvancedEnumeratorParam<TKey> param)
     {
         return new AdvancedEnumerator(this, param);
+    }
+
+    public ulong DictId => _id;
+
+    public void Upsert(IEnumerable? list)
+    {
+        if (list == null) return;
+        if (list is IEnumerable<TKey> listOfKey)
+        {
+            foreach (var key in listOfKey)
+            {
+                Add(key);
+            }
+        }
+        else
+        {
+            foreach (TKey key in list)
+            {
+                Add(key);
+            }
+        }
     }
 }

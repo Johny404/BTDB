@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Threading;
 using BTDB.Collections;
 
@@ -14,4 +13,5 @@ public struct ValueReplacerCtx
     internal byte[] _interruptedKey;
     internal bool _afterFirst;
     internal uint _targetFileId;
+    internal uint _timeoutTestCounter;
 }

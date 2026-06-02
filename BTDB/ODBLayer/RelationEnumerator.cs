@@ -2,9 +2,6 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-using BTDB.Buffer;
-using BTDB.Collections;
 using BTDB.KVDBLayer;
 using BTDB.StreamLayer;
 
@@ -21,17 +18,17 @@ public struct ConstraintInfo
 
 class RelationConstraintEnumerator<T> : IEnumerator<T>, IEnumerable<T> where T : class
 {
-    readonly IInternalObjectDBTransaction _transaction;
+    protected readonly IInternalObjectDBTransaction _transaction;
     protected readonly RelationInfo.ItemLoaderInfo ItemLoader;
-    readonly ConstraintInfo[] _constraints;
+    protected readonly ConstraintInfo[] _constraints;
     protected readonly IKeyValueDBTransaction KeyValueTr;
     protected IKeyValueDBCursor? _cursor;
 
-    bool _seekNeeded;
+    protected bool _seekNeeded;
 
-    int _skipNextOn = -1;
-    int _keyBytesCount;
-    MemWriter _buffer;
+    protected int _skipNextOn = -1;
+    protected int _keyBytesCount;
+    protected MemWriter _buffer;
     protected MemWriter _key;
 
     public RelationConstraintEnumerator(IInternalObjectDBTransaction tr, RelationInfo relationInfo,
@@ -375,6 +372,7 @@ class RelationConstraintEnumerator<T> : IEnumerator<T>, IEnumerable<T> where T :
             i++;
         }
 
+        if (!_cursor!.FindFirstKey(writer.GetSpan())) return 0;
         startIteration:
         var count = 0UL;
         _cursor!.FastIterate(ref buf, (index, key) =>
@@ -592,7 +590,7 @@ class RelationSecondaryKeyEnumerator<T> : RelationEnumerator<T>
     }
 }
 
-public class RelationAdvancedEnumerator<T> : IEnumerator<T>, ICollection<T>
+public class RelationAdvancedEnumerator<T> : IEnumerator<T>, ICollection<T>, IReadOnlyCollection<T>
 {
     protected readonly IRelationDbManipulator Manipulator;
     protected readonly RelationInfo.ItemLoaderInfo ItemLoader;
@@ -969,7 +967,7 @@ public class RelationAdvancedOrderedEnumerator<TKey, TValue> : IOrderedDictionar
     bool _seekNeeded;
     readonly bool _ascending;
     readonly byte[] _keyBytes;
-    protected ReaderFun<TKey>? KeyReader;
+    protected RefReaderFun? KeyReader;
 
     public RelationAdvancedOrderedEnumerator(IRelationDbManipulator manipulator, EnumerationOrder order,
         KeyProposition startKeyProposition, int prefixLen, in ReadOnlySpan<byte> startKeyBytes,
@@ -1001,17 +999,20 @@ public class RelationAdvancedOrderedEnumerator<TKey, TValue> : IOrderedDictionar
             switch (_startCursor.Find(startKeyBytes, (uint)prefixLen))
             {
                 case FindResult.Exact:
+                case FindResult.Next:
                     if (startKeyProposition == KeyProposition.Excluded)
                     {
-                        if (!_startCursor.FindNextKey(_keyBytes)) return;
+                        if (_startCursor.KeyHasPrefix(startKeyBytes))
+                        {
+                            _startCursor.FindLastKey(startKeyBytes);
+                            if (!_startCursor.FindNextKey(_keyBytes)) return;
+                        }
                     }
 
                     break;
                 case FindResult.Previous:
                     if (!_startCursor.FindNextKey(_keyBytes)) return;
-                    break;
-                case FindResult.Next:
-                    break;
+                    goto case FindResult.Next;
                 case FindResult.NotFound:
                     return;
                 default:
@@ -1063,7 +1064,7 @@ public class RelationAdvancedOrderedEnumerator<TKey, TValue> : IOrderedDictionar
             var advancedEnumParamField = primaryKeyFields.Span[prefixFieldCount];
             if (advancedEnumParamField.Handler!.NeedsCtx())
                 throw new BTDBException("Not supported.");
-            KeyReader = (ReaderFun<TKey>)manipulator.RelationInfo
+            KeyReader = manipulator.RelationInfo
                 .GetSimpleLoader(new RelationInfo.SimpleLoaderType(advancedEnumParamField.Handler, typeof(TKey)));
         }
     }
@@ -1170,7 +1171,8 @@ public class RelationAdvancedOrderedEnumerator<TKey, TValue> : IOrderedDictionar
         fixed (void* _ = keySpan)
         {
             var reader = MemReader.CreateFromPinnedSpan(keySpan);
-            key = KeyReader!(ref reader, null);
+            key = default;
+            KeyReader!(ref reader, _tr, ref Unsafe.As<TKey, byte>(ref key));
         }
 
         return true;
@@ -1206,7 +1208,7 @@ public class RelationAdvancedOrderedSecondaryKeyEnumerator<TKey, TValue> :
         var advancedEnumParamField = secKeyFields[prefixFieldCount];
         if (advancedEnumParamField.Handler!.NeedsCtx())
             throw new BTDBException("Not supported.");
-        KeyReader = (ReaderFun<TKey>)manipulator.RelationInfo
+        KeyReader = manipulator.RelationInfo
             .GetSimpleLoader(new(advancedEnumParamField.Handler, typeof(TKey)));
     }
 

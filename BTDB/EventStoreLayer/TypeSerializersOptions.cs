@@ -1,5 +1,6 @@
 ﻿using BTDB.Encrypted;
 using BTDB.FieldHandler;
+using BTDB.Serialization;
 
 namespace BTDB.EventStoreLayer;
 
@@ -7,7 +8,8 @@ public class TypeSerializersOptions
 {
     public static TypeSerializersOptions Default { get; } = new TypeSerializersOptions
     {
-        IgnoreIIndirect = true
+        IgnoreIIndirect = true,
+        PreserveDescriptors = true
     };
 
     /// <summary>
@@ -21,5 +23,9 @@ public class TypeSerializersOptions
 
     public ITypeConvertorGenerator? ConvertorGenerator { get; set; }
 
+    public ITypeConverterFactory? ConvertorFactory { get; set; }
+
     public bool ForbidSerializeLazyDBObjects { get; set; }
+
+    public bool PreserveDescriptors { get; set; }
 }

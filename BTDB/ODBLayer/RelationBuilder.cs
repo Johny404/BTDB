@@ -8,23 +8,42 @@ using System.Runtime.CompilerServices;
 using BTDB.FieldHandler;
 using BTDB.IL;
 using BTDB.KVDBLayer;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
 
 // ReSharper disable ParameterOnlyUsedForPreconditionCheck.Local
 
 namespace BTDB.ODBLayer;
 
-public class RelationBuilder
+public interface IRelationBuilder
+{
+    Type InterfaceType { get; }
+    Type ItemType { get; }
+    object PristineItemInstance { get; }
+    RelationVersionInfo ClientRelationVersionInfo { get; }
+    List<Type> LoadTypes { get; }
+    IRelationInfoResolver RelationInfoResolver { get; }
+    Func<RelationInfo, Func<IObjectDBTransaction, IRelation>> DelegateCreator { get; }
+}
+
+public class RelationBuilder : IRelationBuilder
 {
     readonly Type _relationDbManipulatorType;
     readonly string _name;
-    public readonly Type InterfaceType;
-    public readonly Type ItemType;
-    public readonly object PristineItemInstance;
-    public readonly RelationVersionInfo ClientRelationVersionInfo;
-    public readonly List<Type> LoadTypes = new();
-    public readonly IRelationInfoResolver RelationInfoResolver;
-    public IILDynamicMethodWithThis DelegateCreator { get; }
+
+    public Type InterfaceType { get; }
+
+    public Type ItemType { get; }
+
+    public object PristineItemInstance { get; }
+
+    public RelationVersionInfo ClientRelationVersionInfo { get; }
+
+    public List<Type> LoadTypes { get; }
+
+    public IRelationInfoResolver RelationInfoResolver { get; }
+
+    public Func<RelationInfo, Func<IObjectDBTransaction, IRelation>> DelegateCreator { get; }
 
     static readonly MethodInfo MemWriterGetSpanMethodInfo =
         typeof(MemWriter).GetMethod(nameof(MemWriter.GetSpan))!;
@@ -43,7 +62,7 @@ public class RelationBuilder
         _relationBuilderCache = new();
     }
 
-    internal static RelationBuilder GetFromCache(Type interfaceType, IRelationInfoResolver relationInfoResolver)
+    internal static IRelationBuilder GetFromCache(Type interfaceType, IRelationInfoResolver relationInfoResolver)
     {
         if (_relationBuilderCache.TryGetValue((interfaceType, relationInfoResolver.ActualOptions.Name),
                 out var res))
@@ -81,20 +100,107 @@ public class RelationBuilder
             relationInfoResolver.ActualOptions.ThrowBTDBException(
                 ItemType.ToSimpleName() + " cannot be registered as singleton");
         _name = InterfaceType.ToSimpleName();
-        ClientRelationVersionInfo = CreateVersionInfoByReflection();
+        var v1 = CreateVersionInfoByMetadata();
+        var v2 = CreateVersionInfoByReflection();
+        if (!RelationVersionInfo.Equal(v1, v2))
+        {
+            throw new InvalidOperationException("" + ItemType.ToSimpleName() +
+                                                " has different metadata and reflection version info: " + v1 + " vs " +
+                                                v2);
+        }
+
+        ClientRelationVersionInfo = v1;
         _relationDbManipulatorType = typeof(RelationDBManipulator<>).MakeGenericType(ItemType);
-        LoadTypes.Add(ItemType);
+        LoadTypes = [ItemType];
         DelegateCreator = Build();
     }
 
-    object CreatePristineInstance()
+    unsafe object CreatePristineInstance()
     {
         var container = RelationInfoResolver.Container;
         var res = container?.ResolveOptional(ItemType);
-        return (res ??
-                (ItemType.GetDefaultConstructor() != null
-                    ? Activator.CreateInstance(ItemType, nonPublic: true)
-                    : RuntimeHelpers.GetUninitializedObject(ItemType)))!;
+        if (res != null) return res;
+        var metadata = ReflectionMetadata.FindByType(ItemType);
+        if (metadata == null)
+            throw new InvalidOperationException("Cannot find metadata for " + ItemType.ToSimpleName());
+        return metadata.Creator();
+    }
+
+    RelationVersionInfo CreateVersionInfoByMetadata()
+    {
+        var metadata = ReflectionMetadata.FindByType(ItemType);
+        if (metadata == null)
+            throw new InvalidOperationException("Cannot find metadata for " + ItemType.ToSimpleName());
+        return new(metadata.Fields, metadata.PrimaryKeyFields!, metadata.IndexOfInKeyValue,
+            metadata.SecondaryKeys!, RelationInfoResolver.FieldHandlerFactory);
+    }
+
+    static bool HasRelationContractAttribute(PropertyInfo property)
+    {
+        return property.GetCustomAttribute<PrimaryKeyAttribute>() != null ||
+               property.GetCustomAttribute<InKeyValueAttribute>() != null ||
+               property.GetCustomAttributes<SecondaryKeyAttribute>().Any() ||
+               property.GetCustomAttribute<PersistedNameAttribute>() != null ||
+               property.GetCustomAttribute<NotStoredAttribute>() != null;
+    }
+
+    PropertyInfo ResolveRelationContractProperty(PropertyInfo property)
+    {
+        if (HasRelationContractAttribute(property)) return property;
+
+        foreach (var interfaceType in ItemType.GetInterfaces().OrderBy(i => i.FullName ?? i.Name, StringComparer.Ordinal))
+        {
+            var interfaceProperty = FindImplementedInterfaceProperty(property, interfaceType);
+            if (interfaceProperty == null || !HasRelationContractAttribute(interfaceProperty)) continue;
+            return interfaceProperty;
+        }
+
+        return property;
+    }
+
+    PropertyInfo? FindImplementedInterfaceProperty(PropertyInfo property, Type interfaceType)
+    {
+        var map = ItemType.GetInterfaceMap(interfaceType);
+        foreach (var interfaceProperty in interfaceType.GetProperties())
+        {
+            if (MapsToInterfaceProperty(property, interfaceProperty, map))
+                return interfaceProperty;
+        }
+
+        return null;
+    }
+
+    static bool MapsToInterfaceProperty(PropertyInfo property, PropertyInfo interfaceProperty, InterfaceMapping map)
+    {
+        return MapsToInterfaceAccessor(property.GetAnyGetMethod(), interfaceProperty.GetAnyGetMethod(), map) ||
+               MapsToInterfaceAccessor(property.GetAnySetMethod(), interfaceProperty.GetAnySetMethod(), map);
+    }
+
+    static bool MapsToInterfaceAccessor(MethodInfo? propertyAccessor, MethodInfo? interfaceAccessor,
+        InterfaceMapping map)
+    {
+        if (propertyAccessor == null || interfaceAccessor == null) return false;
+
+        for (var i = 0; i < map.InterfaceMethods.Length; i++)
+        {
+            if (map.InterfaceMethods[i] == interfaceAccessor)
+                return map.TargetMethods[i] == propertyAccessor;
+        }
+
+        return false;
+    }
+
+    TableFieldInfo BuildTableFieldInfo(PropertyInfo property, PropertyInfo attributeSource,
+        FieldHandlerOptions handlerOptions, bool inKeyValue)
+    {
+        var fieldHandler = RelationInfoResolver.FieldHandlerFactory.CreateFromType(property.PropertyType, handlerOptions);
+        if (fieldHandler == null)
+            throw new BTDBException(string.Format(
+                "FieldHandlerFactory did not build property {0} of type {2} in {1}", property.Name, _name,
+                property.PropertyType.FullName));
+        var persistedName = attributeSource.GetCustomAttribute<PersistedNameAttribute>();
+        return TableFieldInfo.Create(persistedName != null ? persistedName.Name : property.Name, fieldHandler,
+            inKeyValue, !property.CanWrite);
     }
 
     RelationVersionInfo CreateVersionInfoByReflection()
@@ -116,7 +222,8 @@ public class RelationBuilder
         var fields = new List<TableFieldInfo>(props.Length);
         foreach (var pi in props)
         {
-            if (pi.GetCustomAttribute<NotStoredAttribute>(true) != null) continue;
+            var relationContractProperty = ResolveRelationContractProperty(pi);
+            if (relationContractProperty.GetCustomAttribute<NotStoredAttribute>(true) != null) continue;
             if (pi.GetIndexParameters().Length != 0) continue;
             if (!pi.CanRead)
             {
@@ -126,9 +233,9 @@ public class RelationBuilder
             }
 
             if (!pi.CanWrite && pi.GetCustomAttribute<CompilerGeneratedAttribute>() != null) continue;
-            var pks = pi.GetCustomAttributes<PrimaryKeyAttribute>(true);
+            var pks = relationContractProperty.GetCustomAttributes<PrimaryKeyAttribute>(true);
             var actualPKAttribute = pks.FirstOrDefault();
-            if (pi.GetCustomAttribute<InKeyValueAttribute>() is { } inKeyValueAttribute)
+            if (relationContractProperty.GetCustomAttribute<InKeyValueAttribute>() is { } inKeyValueAttribute)
             {
                 if (actualPKAttribute != null)
                     RelationInfoResolver.ActualOptions.ThrowBTDBException(
@@ -144,15 +251,15 @@ public class RelationBuilder
                         $"Key field {pi.Name} must have setter, cannot be computed");
                 }
 
-                var fieldInfo = TableFieldInfo.Build(_name, pi, RelationInfoResolver.FieldHandlerFactory,
-                    FieldHandlerOptions.Orderable, actualPKAttribute.InKeyValue);
+                var fieldInfo = BuildTableFieldInfo(pi, relationContractProperty, FieldHandlerOptions.Orderable,
+                    actualPKAttribute.InKeyValue);
                 if (fieldInfo.Handler!.NeedsCtx())
                     RelationInfoResolver.ActualOptions.ThrowBTDBException(
                         $"Unsupported key field {fieldInfo.Name} type.");
                 primaryKeys.Add(actualPKAttribute.Order, fieldInfo);
             }
 
-            var sks = pi.GetCustomAttributes(typeof(SecondaryKeyAttribute), true);
+            var sks = relationContractProperty.GetCustomAttributes(typeof(SecondaryKeyAttribute), true);
             var id = (int)(-actualPKAttribute?.Order ?? secondaryKeyFields.Count);
             List<SecondaryKeyAttribute> currentList = null;
             if (sks.Length == 0 && !pi.CanWrite)
@@ -174,8 +281,8 @@ public class RelationBuilder
                     currentList = new(sks.Length);
                     secondaryKeys.Add(new(id, currentList));
                     if (actualPKAttribute == null)
-                        secondaryKeyFields.Add(TableFieldInfo.Build(_name, pi,
-                            RelationInfoResolver.FieldHandlerFactory, FieldHandlerOptions.Orderable, false));
+                        secondaryKeyFields.Add(BuildTableFieldInfo(pi, relationContractProperty,
+                            FieldHandlerOptions.Orderable, false));
                 }
 
                 var key = (SecondaryKeyAttribute)sks[i];
@@ -186,8 +293,7 @@ public class RelationBuilder
             }
 
             if (actualPKAttribute == null)
-                fields.Add(TableFieldInfo.Build(_name, pi, RelationInfoResolver.FieldHandlerFactory,
-                    FieldHandlerOptions.None, false));
+                fields.Add(BuildTableFieldInfo(pi, relationContractProperty, FieldHandlerOptions.None, false));
         }
 
         return new(primaryKeys, secondaryKeys, secondaryKeyFields.ToArray(), fields.ToArray());
@@ -207,19 +313,29 @@ public class RelationBuilder
         return LoadTypes.Count - 1;
     }
 
-    IILDynamicMethodWithThis Build()
+    Func<RelationInfo, Func<IObjectDBTransaction, IRelation>> Build()
     {
         var interfaceType = InterfaceType;
+        if (IFieldHandler.UseNoEmitForRelations)
+        {
+            var creator = ReflectionMetadata.FindRelationCreatorByType(interfaceType);
+            if (creator != null)
+            {
+                LoadTypes.Clear();
+                LoadTypes.AddRange(creator.Value.Item2);
+                return creator.Value.Item1;
+            }
+        }
+
         var relationName = interfaceType!.ToSimpleName();
         var classImpl = ILBuilder.Instance.NewType("Relation" + relationName, _relationDbManipulatorType,
-            new[] { interfaceType });
+            [interfaceType]);
         var constructorMethod =
-            classImpl.DefineConstructor(new[] { typeof(IObjectDBTransaction), typeof(RelationInfo) });
+            classImpl.DefineConstructor([typeof(IObjectDBTransaction), typeof(RelationInfo)]);
         var il = constructorMethod.Generator;
         // super.ctor(transaction, relationInfo);
         il.Ldarg(0).Ldarg(1).Ldarg(2)
-            .Call(_relationDbManipulatorType.GetConstructor(new[]
-                { typeof(IObjectDBTransaction), typeof(RelationInfo) })!)
+            .Call(_relationDbManipulatorType.GetConstructor([typeof(IObjectDBTransaction), typeof(RelationInfo)])!)
             .Ret();
         var methods = RelationInfo.GetMethods(interfaceType);
         foreach (var method in methods)
@@ -268,6 +384,10 @@ public class RelationBuilder
             else if (method.Name.StartsWith("FirstBy", StringComparison.Ordinal))
             {
                 BuildFirstByMethod(method, reqMethod);
+            }
+            else if (method.Name.StartsWith("LastBy", StringComparison.Ordinal))
+            {
+                BuildLastByMethod(method, reqMethod);
             }
             else if (method.Name.StartsWith("FindBy", StringComparison.Ordinal))
             {
@@ -333,10 +453,10 @@ public class RelationBuilder
         ilGenerator
             .Ldarg(1)
             .Ldarg(0)
-            .Newobj(classImplType.GetConstructor(new[] { typeof(IObjectDBTransaction), typeof(RelationInfo) })!)
+            .Newobj(classImplType.GetConstructor([typeof(IObjectDBTransaction), typeof(RelationInfo)])!)
             .Castclass(typeof(IRelation))
             .Ret();
-        return methodBuilder;
+        return ri => (Func<IObjectDBTransaction, IRelation>)methodBuilder.Create(ri);
     }
 
     static string SubstringAfterBy(string name)
@@ -423,6 +543,77 @@ public class RelationBuilder
             CreateMethodFirstBy(reqMethod.Generator, method.Name, method.ReturnType, method.GetParameters(),
                 nameWithoutVariants.HasOrDefault, nameWithoutVariants.IndexName);
         }
+    }
+
+    void BuildLastByMethod(MethodInfo method, IILMethod reqMethod)
+    {
+        if (!method.ReturnType.IsClass)
+        {
+            RelationInfoResolver.ActualOptions.ThrowBTDBException(
+                $"Method {method.Name} must have class return type.");
+        }
+
+        var nameWithoutVariants = StripVariant(SubstringAfterBy(method.Name), true);
+        if (nameWithoutVariants.IndexName is "Id")
+        {
+            CreateMethodLastById(reqMethod.Generator, method.Name, method.ReturnType, method.GetParameters(),
+                nameWithoutVariants.HasOrDefault);
+        }
+        else
+        {
+            CreateMethodLastBy(reqMethod.Generator, method.Name, method.ReturnType, method.GetParameters(),
+                nameWithoutVariants.HasOrDefault, nameWithoutVariants.IndexName);
+        }
+    }
+
+    void CreateMethodLastBy(IILGen ilGenerator, string methodName, Type itemType, ParameterInfo[] methodParameters,
+        bool hasOrDefault, string skName)
+    {
+        var constraintsLocal = ilGenerator.DeclareLocal(typeof(ConstraintInfo[]));
+
+        var skIndex = ClientRelationVersionInfo.GetSecondaryKeyIndex(skName);
+
+        var secondaryKeyFields = ClientRelationVersionInfo.GetSecondaryKeyFields(skIndex);
+
+        var constraintsParameters = methodParameters.AsSpan();
+        var orderersLocal = DetectOrderers(ilGenerator, ref constraintsParameters, 0);
+        SaveMethodConstraintParameters(ilGenerator, methodName, constraintsParameters, secondaryKeyFields,
+            constraintsLocal);
+
+        //call manipulator.LastBy_
+        ilGenerator
+            .Ldarg(0) //manipulator
+            .LdcI4(RegisterLoadType(itemType!))
+            .Ldloc(constraintsLocal)
+            .LdcI4((int)skIndex)
+            .Ldloc(orderersLocal)
+            .LdcI4(hasOrDefault ? 1 : 0)
+            .Callvirt(
+                _relationDbManipulatorType.GetMethod(
+                    nameof(RelationDBManipulator<IRelation>.LastBySecondaryKey))!.MakeGenericMethod(itemType));
+    }
+
+    void CreateMethodLastById(IILGen ilGenerator, string methodName, Type itemType, ParameterInfo[] methodParameters,
+        bool hasOrDefault)
+    {
+        var constraintsLocal = ilGenerator.DeclareLocal(typeof(ConstraintInfo[]));
+        var primaryKeyFields = ClientRelationVersionInfo.PrimaryKeyFields;
+        var constraintsParameters = methodParameters.AsSpan();
+        var orderersLocal = DetectOrderers(ilGenerator, ref constraintsParameters, 0);
+
+        SaveMethodConstraintParameters(ilGenerator, methodName, constraintsParameters, primaryKeyFields.Span,
+            constraintsLocal);
+
+        //call manipulator.LastBy_
+        ilGenerator
+            .Ldarg(0) //manipulator
+            .LdcI4(RegisterLoadType(itemType))
+            .Ldloc(constraintsLocal)
+            .Ldloc(orderersLocal)
+            .LdcI4(hasOrDefault ? 1 : 0)
+            .Callvirt(
+                _relationDbManipulatorType.GetMethod(
+                    nameof(RelationDBManipulator<IRelation>.LastByPrimaryKey))!.MakeGenericMethod(itemType));
     }
 
     void CreateMethodFirstBy(IILGen ilGenerator, string methodName, Type itemType, ParameterInfo[] methodParameters,
@@ -1174,6 +1365,8 @@ public class RelationBuilder
 
             foreach (var valueField in valueFields)
             {
+                if (valueField.Computed) continue;
+
                 var paramIndex = -1;
                 for (var j = 0; j < updateParams.Length; j++)
                 {

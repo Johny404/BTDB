@@ -2,16 +2,28 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using BTDB;
+using BTDB.IL;
 using BTDB.IOC;
+using BTDB.ODBLayer;
 using BTDB.Serialization;
-using Microsoft.AspNetCore.Http;
+using BTDB.StreamLayer;
+using Sample3rdPartyLib;
+
+[assembly: GenerateFor(typeof(Class3rdPartyWithKeyedDependency))]
+
+DynamicValueWrapperRegistration.Register4BTDB();
 
 unsafe
 {
     var builder = new ContainerBuilder();
 //builder.RegisterType<Klass>();
-    builder.AutoRegisterTypes().AsSelf();
+    builder.AutoRegisterTypes().Where(t => !t.InheritsOrImplements(typeof(I3rdPartyInterface))).AsSelf();
+    builder.RegisterType<Class3rdPartyWithKeyedDependency>().AsSelf();
+    builder.RegisterType<K3rdPartyDependencyWrong>().As<I3rdPartyInterface>();
+    builder.RegisterType<K3rdPartyDependency>().Named<I3rdPartyInterface>("Key1");
     var container = builder.Build();
+    var name = container.Resolve<Class3rdPartyWithKeyedDependency>().Name;
+    Console.WriteLine(name);
     container.Resolve<Klass>();
     {
         var h = IAnyHandler.CreateConsumeDispatcher(container);
@@ -19,19 +31,86 @@ unsafe
     }
 
     {
+        DictEntry<int, string> e1 = new();
         ReflectionMetadata.RegisterCollection(new()
         {
             Type = typeof(Dictionary<int, string>),
             ElementKeyType = typeof(int),
             ElementValueType = typeof(string),
+            OffsetNext = (uint)Unsafe.ByteOffset(ref Unsafe.As<DictEntry<int, string>, byte>(ref e1),
+                ref Unsafe.As<int, byte>(ref e1.Next)),
+            OffsetKey = (uint)Unsafe.ByteOffset(ref Unsafe.As<DictEntry<int, string>, byte>(ref e1),
+                ref Unsafe.As<int, byte>(ref e1.Key)),
+            OffsetValue = (uint)Unsafe.ByteOffset(ref Unsafe.As<DictEntry<int, string>, byte>(ref e1),
+                ref Unsafe.As<string, byte>(ref e1.Value)),
+            SizeOfEntry = (uint)Unsafe.SizeOf<DictEntry<int, string>>(),
             Creator = &Create1,
             AdderKeyValue = &Add1
         });
         ReflectionMetadata.RegisterStackAllocator(typeof((int, string)), &AllocateValueType);
     }
 
+    {
+        TupleIntString value = new();
+        ReflectionMetadata.Register(new()
+        {
+            Type = typeof(Tuple<int, string>),
+            Creator = &Create2,
+            Name = "Tuple<int,string>",
+            Namespace = "System",
+            Fields =
+            [
+                new()
+                {
+                    Name = "Item1",
+                    Type = typeof(int),
+                    ByteOffset = RawData.CalcOffset(value, ref value.Item1),
+                },
+                new()
+                {
+                    Name = "Item2",
+                    Type = typeof(string),
+                    ByteOffset = RawData.CalcOffset(value, ref value.Item2),
+                }
+            ]
+        });
+    }
+
+    {
+        ValueTupleIntString value = new();
+        ReflectionMetadata.Register(new()
+        {
+            Type = typeof(ValueTuple<int, string>),
+            Name = "ValueTuple<int,string>",
+            Namespace = "System",
+            Fields =
+            [
+                new()
+                {
+                    Name = "Item1",
+                    Type = typeof(int),
+                    ByteOffset = (uint)Unsafe.ByteOffset(ref Unsafe.As<ValueTupleIntString, byte>(ref value),
+                        ref Unsafe.As<int, byte>(ref value.Item1)),
+                },
+                new()
+                {
+                    Name = "Item2",
+                    Type = typeof(string),
+                    ByteOffset = (uint)Unsafe.ByteOffset(ref Unsafe.As<ValueTupleIntString, byte>(ref value),
+                        ref Unsafe.As<string, byte>(ref value.Item2)),
+                }
+            ]
+        });
+    }
+
+
     MyCtx myCtx = default;
     AllocateValueType(ref Unsafe.As<MyCtx, byte>(ref myCtx), ref myCtx.Ptr, &WorkWithAllocatedValueType);
+
+    static object Create2()
+    {
+        return new Tuple<int, string>(default, default!);
+    }
 
     static object Create1(uint capacity)
     {
@@ -133,5 +212,174 @@ public class ErrorHandler
     {
         get => null;
         init => Console.WriteLine(value!.ToString());
+    }
+}
+
+[Generate]
+public class K3rdPartyDependency : I3rdPartyInterface
+{
+    public string Name => "K3rdPartyDependency";
+}
+
+[Generate]
+public class K3rdPartyDependencyWrong : I3rdPartyInterface
+{
+    public string Name => "K3rdPartyDependencyWrong";
+}
+
+public struct DictEntry<TKey, TValue>
+{
+    public uint HashCode;
+    public int Next;
+    public TKey Key;
+    public TValue Value;
+}
+
+public class TupleIntString
+{
+    public int Item1;
+    public string Item2 = null!;
+}
+
+public struct ValueTupleIntString
+{
+    public int Item1;
+    public string Item2;
+}
+
+public interface IDynamicValue
+{
+}
+
+public class DynamicValueWrapper<TValueType> : IDynamicValue
+{
+    public required TValueType Value { get; set; }
+}
+
+static file class DynamicValueWrapperRegistration
+{
+    class Accessor<T1>
+    {
+        [UnsafeAccessor(UnsafeAccessorKind.Constructor)]
+        public static extern DynamicValueWrapper<T1> Creator();
+
+        [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "<Value>k__BackingField")]
+        public static extern ref T1 Field1(DynamicValueWrapper<T1> @this);
+    }
+
+    internal static unsafe void Register4BTDB()
+    {
+        var metadata = new ClassMetadata();
+        metadata.Name = "DynamicValueWrapper<System.Enum>";
+        metadata.Type = typeof(DynamicValueWrapper<Enum>);
+        metadata.Namespace = "BTDBTest";
+        metadata.Implements = [typeof(IDynamicValue)];
+        metadata.Creator = &Accessor<Enum>.Creator;
+        var dummy = Unsafe.As<DynamicValueWrapper<Enum>>(metadata);
+        metadata.Fields =
+        [
+            new()
+            {
+                Name = "Value",
+                Type = typeof(Enum),
+                ByteOffset = RawData.CalcOffset(dummy, ref Accessor<Enum>.Field1(dummy)),
+            },
+        ];
+        ReflectionMetadata.Register(metadata);
+    }
+}
+
+public class Person2
+{
+    [PrimaryKey(1)] public string Name { get; set; } = null!;
+
+    [OnBeforeRemove]
+    public bool OnBeforeRemove()
+    {
+        Console.WriteLine($"Person2 {Name} is being removed");
+        return true;
+    }
+
+    [OnBeforeRemove]
+    public bool SecondOnBeforeRemove(IObjectDBTransaction transaction)
+    {
+        Console.WriteLine($"In transaction {transaction.KeyValueDBTransaction.GetCommitUlong()}");
+        return true;
+    }
+
+    [OnBeforeRemove]
+    public bool ThirdOnBeforeRemove(I3rdPartyInterface dependency, I3rdPartyInterface? key1)
+    {
+        Console.WriteLine($"Dependency says: {dependency.Name}");
+        Console.WriteLine($"Key1 says: {key1!.Name}");
+        return true;
+    }
+}
+
+public class Test
+{
+    [PrimaryKey(1)] public ulong Id { get; set; }
+    public string Name { get; set; } = null!;
+    public int Age { get; set; }
+}
+
+public class JustAge
+{
+    public int Age { get; set; }
+}
+
+public class JustName
+{
+    public string Name { get; set; } = null!;
+}
+
+public interface IWithInsert<T>
+{
+    void Insert(T user);
+}
+
+public interface IVariantTestTable : IWithInsert<Test>, IRelation<Test>
+{
+    JustAge FindById(ulong id);
+    ulong GatherById(ICollection<JustName> items, long skip, long take, Constraint<ulong> id);
+}
+
+static file class ImplVariantTestTableRegistration
+{
+    public class ImplVariantTestTable : global::BTDB.ODBLayer.RelationDBManipulator<Test>, IVariantTestTable
+    {
+        public ImplVariantTestTable(IObjectDBTransaction transaction, RelationInfo relationInfo) : base(transaction,
+            relationInfo)
+        {
+        }
+
+        [global::System.Runtime.CompilerServices.SkipLocalsInit]
+        void IWithInsert<Test>.Insert(Test item)
+        {
+            base.Insert(item);
+        }
+
+        [global::System.Runtime.CompilerServices.SkipLocalsInit]
+        JustAge IVariantTestTable.FindById(ulong id)
+        {
+            var writer = MemWriter.CreateFromStackAllocatedSpan(stackalloc byte[512]);
+            WriteRelationPKPrefix(ref writer);
+            writer.WriteVUInt64(id);
+            return FindByIdOrDefault<JustAge>(writer.GetSpan(), true, 1);
+        }
+
+        ulong IVariantTestTable.GatherById(ICollection<JustName> items, long skip, long take, Constraint<ulong> id)
+        {
+            var c_c = new ConstraintInfo[1];
+            c_c[0].Constraint = id;
+            return GatherByPrimaryKey(2, c_c, items, skip, take, null);
+        }
+    }
+
+    internal static void Register4BTDB()
+    {
+        ReflectionMetadata.RegisterRelation(typeof(IVariantTestTable),
+            info => { return transaction => new ImplVariantTestTable(transaction, info); },
+            [typeof(Test), typeof(JustAge), typeof(JustName)]);
     }
 }

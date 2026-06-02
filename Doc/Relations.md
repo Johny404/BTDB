@@ -210,12 +210,17 @@ because only fields with matching names and types will be deserialized. Note: Th
 
     IOrderedDictionaryEnumerator<uint, Person> ListById(AdvancedEnumeratorParam<uint> param);
     IEnumerable<Person> ListById(AdvancedEnumeratorParam<uint> param);
+    ICollection<Person> ListById2(AdvancedEnumeratorParam<uint> param);
+    IReadOnlyCollection<Person> ListById3(AdvancedEnumeratorParam<uint> param);
     IEnumerable<Person> ListById();
+    ICollection<Person> ListById2();
+    IReadOnlyCollection<Person> ListById3();
 
 List by ascending/descending order and specified range. Parts of primary key may be used for listing. In example below
 you can list all rooms or just rooms for specified company by two `ListById` method. (`IOrderedDictionaryEnumerator`,
-`IEnumerable` can be used as return values if used without AdvancedEnumeratorParam only `IEnumerable` could be used and
-it is ascending order only.)
+`IEnumerable`, `ICollection`, or `IReadOnlyCollection` can be used as return values. If used without
+AdvancedEnumeratorParam only `IEnumerable`/`ICollection`/`IReadOnlyCollection` could be used and it is ascending
+order only.)
 
 ```C#
     public class Room
@@ -257,7 +262,7 @@ missing constraints are automatically "Any"):
 
     var roomsOf1 = table.ScanById(Constraint.Unsigned.Exact(1));
 
-Scan by primary key also support variants like `ScanByIdVariantName`.
+Scan by primary key also support variants like `ScanByIdVariantName`. Return type can be only `IEnumerable<T>`.
 
 `Scan` can do most of the same stuff as `List`, it is a little bit slower though, so prefer `List` if you can. `Scan`
 needs
@@ -300,6 +305,17 @@ without sorting. Logical order of operations is where constraints, sort, skip, t
 It is like GatherBy only with take one. It is faster because of that does not need to sort and allocate too much.
 Version without OrDefault throws is not item matches.
 First by primary key also support variants like `FirstByIdVariantName` and `FirstByIdOrDefaultVariantName`.
+
+### LastById
+
+    Room LastById(Constraint<ulong> companyId, Constraint<ulong> id);
+    Room? LastByIdOrDefault(Constraint<ulong> companyId, Constraint<ulong> id);
+    Room LastById(Constraint<ulong> companyId, Constraint<ulong> id, IOrderers[]? orderers);
+    Room? LastByIdOrDefault(Constraint<ulong> companyId, Constraint<ulong> id, IOrderers[]? orderers);
+
+It is like FirstById only it searches from the end.
+Version without OrDefault throws is not item matches.
+Last by primary key also support variants like `LastByIdVariantName` and `LastByIdOrDefaultVariantName`.
 
 ### Count
 
@@ -449,6 +465,18 @@ It is like GatherBy only with take one. It is faster because of that does not ne
 Version without OrDefault throws is not item matches.
 First by secondary key also support variants like `FirstByNameVariantName` and `FirstByNameOrDefaultVariantName`.
 
+### Last (by secondary index)
+
+    Person LastByName(Constraint<ulong> tenantId, Constraint<string> name);
+    Person? LastByNameOrDefault(Constraint<ulong> tenantId, Constraint<string> name);
+    Person LastByName(Constraint<ulong> tenantId, Constraint<string> name, IOrderers[]? orderers);
+    Person? LastByNameOrDefault(Constraint<ulong> tenantId, Constraint<string> name, IOrderers[]? orderers);
+
+It is like FirstByName only it searches from the end.
+Version without OrDefault throws is not item matches.
+Last by secondary key also support variants like `LastByNameVariantName` and `LastByNameOrDefaultVariantName`.
+
+
 ### Upgrade
 
 When secondary definition is changed (for example new index is defined) then it is automatically
@@ -457,9 +485,9 @@ added/recalculated/removed in `InitRelation` call. You can see examples in
 
 ## Free content
 
-During removing or updating of data, all IDictionaries and IOrderedSets present in removed data are automatically
-cleared to avoid data leaks (Also works recursively IDictionaries are freed automatically if they are nested in another
-IDictionary). You can see examples in
+During removing or updating of data, all IDictionaries, IOrderedSets, and IRoaringBitmaps present in removed data are
+automatically cleared to avoid data leaks (Also works recursively IDictionaries are freed automatically if they are
+nested in another IDictionary). You can see examples in
 [ObjectDbTableFreeContentTest](../BTDBTest/ObjectDbTableFreeContentTest.cs)
 
 If you have IIndirect property. You are on your own. And that's include any nested IDictionary which needs to be cleared
@@ -541,6 +569,55 @@ because they need to deserialize all removing items.
         }
     }
 ```
+
+## Interface contracts for class relation items
+
+For source-generated relations, `T` in `IRelation<T>` is still a class. The generator can use interfaces implemented by
+that class (including inherited interfaces) as the source of persisted fields/indexes and lifecycle hooks.
+`OnSerialize` and `OnBeforeRemove` methods can be declared on the interface contract.
+
+```C#
+    public interface IRoom
+    {
+        [PrimaryKey(1)]
+        ulong CompanyId { get; set; }
+
+        string Name { get; set; }
+
+        [OnSerialize]
+        void Normalize();
+
+        [OnBeforeRemove]
+        bool CanRemove(IObjectDBTransaction transaction);
+    }
+
+    public partial class Room : IRoom
+    {
+    }
+
+    public partial class Room
+    {
+        public virtual ulong CompanyId { get; set; }
+        public virtual string Name { get; set; } = "";
+
+        public virtual void Normalize()
+        {
+        }
+
+        public virtual bool CanRemove(IObjectDBTransaction transaction)
+        {
+            return false;
+        }
+    }
+
+    public interface IRoomTable : IRelation<Room>
+    {
+        Room FindById(ulong companyId);
+    }
+```
+
+This is useful when the class is generated in multiple partial declarations and one generator provides the interface
+contract while another provides implementations.
 
 ## ShallowUpsertWithSizes
 

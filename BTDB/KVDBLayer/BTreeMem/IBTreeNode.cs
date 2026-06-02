@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using BTDB.Collections;
 
 namespace BTDB.KVDBLayer.BTreeMem;
@@ -21,6 +20,6 @@ interface IBTreeNode
     IBTreeNode EraseOne(long transactionId, long keyIndex);
     void CalcBTreeStats(RefDictionary<(uint Depth, uint Children), uint> stats, uint depth);
 
-    void FastIterate(int deepness, ref StructList<NodeIdxPair> stack, ref long keyIndex,
+    bool FastIterate(int deepness, ref StructList<NodeIdxPair> stack, ref long keyIndex,
         CursorIterateCallback callback);
 }

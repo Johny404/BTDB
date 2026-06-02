@@ -1,0 +1,23 @@
+﻿{
+  Diagnostics: [
+    {
+      Location: /*
+    // AdvancedEnumeratorParam targets implicit primary key field; use mismatched type to validate checks.
+    IEnumerable<Person> ListByName(ulong tenantId, string name, AdvancedEnumeratorParam<string> param);
+                                                                                                ^^^^^
+}
+*/
+ : (15,96)-(15,101),
+      Message: AdvancedEnumeratorParam generic type 'string' does not match field 'Id' type 'ulong' in method 'ListByName',
+      Severity: Error,
+      Descriptor: {
+        Id: BTDB0031,
+        Title: AdvancedEnumeratorParam generic type 'string' does not match field 'Id' type 'ulong' in method 'ListByName',
+        MessageFormat: AdvancedEnumeratorParam generic type 'string' does not match field 'Id' type 'ulong' in method 'ListByName',
+        Category: BTDB,
+        DefaultSeverity: Error,
+        IsEnabledByDefault: true
+      }
+    }
+  ]
+}

@@ -3,13 +3,13 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using BTDB.Buffer;
 using BTDB.Collections;
 using BTDB.Encrypted;
 using BTDB.FieldHandler;
 using BTDB.IL;
 using BTDB.KVDBLayer;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
 
 namespace BTDB.ODBLayer;
@@ -30,7 +30,6 @@ public class ODBIterator
     readonly HashSet<ulong> _visitedOids;
     readonly HashSet<TableIdVersionId> _usedTableVersions;
     readonly Dictionary<TableIdVersionId, TableVersionInfo> _tableVersionInfos;
-    readonly Dictionary<IFieldHandler, SkipperFun> _skippers;
 
     readonly Dictionary<IFieldHandler, LoaderFun> _loaders;
 
@@ -42,6 +41,7 @@ public class ODBIterator
     public IReadOnlyDictionary<uint, ODBIteratorRelationInfo> RelationId2Info => _relationId2Info;
     public IReadOnlyDictionary<TableIdVersionId, TableVersionInfo> TableVersionInfos => _tableVersionInfos;
     public bool SkipAlreadyVisitedOidChecks;
+    DefaultTypeConverterFactory _typeConverterFactory = new DefaultTypeConverterFactory();
 
     public ODBIterator(IObjectDBTransaction tr, IODBFastVisitor visitor)
     {
@@ -54,7 +54,6 @@ public class ODBIterator
         _usedTableVersions = new();
         _tableVersionInfos = new();
 
-        _skippers = new(ReferenceEqualityComparer<IFieldHandler>.Instance);
         _loaders = new(ReferenceEqualityComparer<IFieldHandler>.Instance);
     }
 
@@ -455,6 +454,54 @@ public class ODBIterator
         _visitor?.EndSet();
     }
 
+    unsafe void IterateRoaringBitmap(ulong dictId)
+    {
+        if (_visitor != null && !_visitor.StartSet())
+            return;
+        var o = ObjectDB.AllDictionariesPrefix.Length;
+        var prefix = new byte[o + PackUnpack.LengthVUInt(dictId)];
+        Array.Copy(ObjectDB.AllDictionariesPrefix, prefix, o);
+        PackUnpack.PackVUInt(prefix, ref o, dictId);
+        using var cursor = _trkv.CreateCursor();
+        Span<byte> keyBuf = stackalloc byte[512];
+        Memory<byte> valueBuf = new byte[RoaringBitmaps.BitmapSize];
+        var countSeen = false;
+        var pageSeen = false;
+        while (cursor.FindNextKey(prefix))
+        {
+            _fastVisitor.MarkCurrentKeyAsUsed(cursor);
+            var keySpan = cursor.GetKeySpan(ref keyBuf);
+            if (keySpan.Length == prefix.Length)
+            {
+                countSeen = true;
+                if (_visitor?.NeedScalarAsText() ?? false)
+                    _visitor.ScalarAsText("Count " +
+                                          PackUnpack.UnpackVUInt(cursor.GetValueMemory(ref valueBuf).Span)
+                                              .ToString(CultureInfo.InvariantCulture));
+                continue;
+            }
+            pageSeen = true;
+            var pageIndex = PackUnpack.UnpackVUInt(keySpan[prefix.Length..]);
+
+            var value = cursor.GetValueMemory(ref valueBuf);
+            foreach (var item in RoaringBitmaps.Enumerate(value, pageIndex << 16))
+            {
+                if (_visitor == null || _visitor.StartSetKey())
+                {
+                    if (_visitor?.NeedScalarAsObject() ?? false)
+                        _visitor.ScalarAsObject(item);
+                    if (_visitor?.NeedScalarAsText() ?? false)
+                        _visitor.ScalarAsText(item.ToString(CultureInfo.InvariantCulture));
+                    _visitor?.EndSetKey();
+                }
+            }
+        }
+
+        if (pageSeen && !countSeen && (_visitor?.NeedScalarAsText() ?? false))
+            _visitor.ScalarAsText("Incomplete");
+        _visitor?.EndSet();
+    }
+
     unsafe void IterateHandler(ref MemReader reader, IFieldHandler handler, bool skipping,
         HashSet<int>? knownInlineRefs)
     {
@@ -476,6 +523,14 @@ public class ODBIterator
                 var keyHandler = ((IFieldHandlerWithNestedFieldHandlers)handler).EnumerateNestedFieldHandlers()
                     .First();
                 IterateSet(dictId, keyHandler);
+            }
+        }
+        else if (handler is ODBRoaringBitmapFieldHandler)
+        {
+            var dictId = reader.ReadVUInt64();
+            if (!skipping)
+            {
+                IterateRoaringBitmap(dictId);
             }
         }
         else if (handler is DBObjectFieldHandler)
@@ -658,29 +713,32 @@ public class ODBIterator
         {
             if (skipping || _visitor == null)
             {
-                if (!_skippers.TryGetValue(handler, out var skipper))
-                {
-                    var meth =
-                        ILBuilder.Instance.NewMethod<SkipperFun>("Skip" + handler.Name);
-                    var il = meth.Generator;
-                    handler.Skip(il, il2 => il2.Ldarg(0), null);
-                    il.Ret();
-                    skipper = meth.Create();
-                    _skippers.Add(handler, skipper);
-                }
-
-                skipper(ref reader);
+                handler.Skip(ref reader, null);
             }
             else
             {
                 if (!_loaders.TryGetValue(handler, out var loader))
                 {
-                    var meth =
-                        ILBuilder.Instance.NewMethod<LoaderFun>("Load" + handler.Name);
-                    var il = meth.Generator;
-                    handler.Load(il, il2 => il2.Ldarg(0), null);
-                    il.Box(handler.HandledType()!).Ret();
-                    loader = meth.Create();
+                    if (IFieldHandler.UseNoEmit)
+                    {
+                        var rawLoader = handler.Load(typeof(object), _typeConverterFactory);
+                        loader = (ref memReader) =>
+                        {
+                            object? res = null;
+                            rawLoader(ref memReader, null, ref Unsafe.As<object?, byte>(ref res));
+                            return res;
+                        };
+                    }
+                    else
+                    {
+                        var meth =
+                            ILBuilder.Instance.NewMethod<LoaderFun>("Load" + handler.Name);
+                        var il = meth.Generator;
+                        handler.Load(il, il2 => il2.Ldarg(0), null);
+                        il.Box(handler.HandledType()!).Ret();
+                        loader = meth.Create();
+                    }
+
                     _loaders.Add(handler, loader);
                 }
 

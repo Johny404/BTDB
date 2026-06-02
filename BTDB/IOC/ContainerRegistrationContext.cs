@@ -1,6 +1,4 @@
 using System.Collections.Generic;
-using System.Reflection;
-using BTDB.Collections;
 using BTDB.KVDBLayer;
 
 namespace BTDB.IOC;
@@ -19,7 +17,7 @@ class ContainerRegistrationContext
 
     internal bool ReportNotGeneratedTypes { get; private set; }
 
-    internal uint SingletonCount { get; private set; }
+    internal uint ScopedCount { get; private set; }
     internal bool AllowReflectionFallback { get; private set; }
 
     public void AddCReg(IEnumerable<KeyAndType> asTypes, bool preserveExistingDefaults, bool uniqueRegistration,
@@ -33,9 +31,9 @@ class ContainerRegistrationContext
 
     public void AddCReg(KeyAndType asType, bool preserveExistingDefaults, bool uniqueRegistration, CReg registration)
     {
-        if (registration.Lifetime == Lifetime.Singleton && registration.SingletonId == uint.MaxValue)
+        if (registration.Lifetime == Lifetime.Scoped && registration.ScopedId == uint.MaxValue)
         {
-            registration.SingletonId = SingletonCount++;
+            registration.ScopedId = ScopedCount++;
         }
 
         if (!_registrations.TryGetValue(asType, out var currentReg))
@@ -56,7 +54,10 @@ class ContainerRegistrationContext
         }
 
         var multi = new CReg
-            { Factory = currentReg.Factory, Lifetime = currentReg.Lifetime, SingletonId = currentReg.SingletonId };
+        {
+            Factory = currentReg.Factory, Lifetime = currentReg.Lifetime, SingletonValue = currentReg.SingletonValue,
+            ScopedId = currentReg.ScopedId, DefaultRegistration = currentReg, IsSingletonSafe = currentReg.IsSingletonSafe
+        };
         multi.Multi.Add(currentReg);
         multi.Add(registration, preserveExistingDefaults);
         _registrations[asType] = multi;

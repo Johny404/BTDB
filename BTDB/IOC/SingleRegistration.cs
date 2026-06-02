@@ -20,6 +20,11 @@ class SingleRegistration : RegistrationBaseImpl<IAsLiveScopeTrait>, IContanerReg
         _lifetime = Lifetime.Singleton;
     }
 
+    public void Scoped()
+    {
+        _lifetime = Lifetime.Scoped;
+    }
+
     public Lifetime Lifetime => _lifetime;
 
     public SingleRegistration(Type implementationType, bool withFallback = false)
@@ -73,8 +78,14 @@ class SingleRegistration : RegistrationBaseImpl<IAsLiveScopeTrait>, IContanerReg
         context.AddCReg(GetAsTypesFor(_implementationType), PreserveExistingDefaults, UniqueRegistration,
             new()
             {
-                Factory = factory, Lifetime = Lifetime, SingletonId = Lifetime == Lifetime.Singleton ? uint.MaxValue : 0
+                Factory = factory, Lifetime = Lifetime,
+                ScopedId = Lifetime == Lifetime.Scoped ? uint.MaxValue : 0
             });
+    }
+
+    public void RegisterForServiceCollection(ServiceCollectionRegistrationContext context)
+    {
+        context.Add(GetAsTypesFor(_implementationType), _lifetime.ToServiceLifetime());
     }
 
     static Func<IContainer, ICreateFactoryCtx, Func<IContainer, IResolvingCtx, object>> BuildFactory(

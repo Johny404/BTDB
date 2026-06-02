@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using BTDB;
 using BTDB.Buffer;
 using BTDB.EventStoreLayer;
 using BTDB.FieldHandler;
@@ -211,6 +212,7 @@ public class EventStoreTest
 
 #pragma warning disable 659
 
+    [Generate]
     public class User : IEquatable<User>
     {
         public string Name { get; set; }
@@ -307,6 +309,7 @@ public class EventStoreTest
     }
 
 #pragma warning disable 659
+    [Generate]
     public class UserEvent : IEquatable<UserEvent>
     {
         public long Id { get; set; }
@@ -352,7 +355,7 @@ public class EventStoreTest
         var appender = manager.AppendToStore(file);
         var user = new User { Name = "A", Age = 1 };
         var userEvent = new UserEvent { Id = 10, User1 = user, User2 = user };
-        appender.Store(null, new object[] { userEvent });
+        appender.Store(null, [userEvent]);
 
         manager = new EventStoreManager();
         var reader = manager.OpenReadOnlyStore(file);
@@ -362,6 +365,7 @@ public class EventStoreTest
         Assert.Same(readUserEvent.User1, readUserEvent.User2);
     }
 
+    [Generate]
     public class UserEventMore : IEquatable<UserEventMore>
     {
         public long Id { get; set; }
@@ -428,6 +432,7 @@ public class EventStoreTest
         Assert.Equal("B", ((User)eventObserver.Events[0][1]).Name);
     }
 
+    [Generate]
     public class UserEventLess : IEquatable<UserEventLess>
     {
         public long Id { get; set; }
@@ -474,11 +479,13 @@ public class EventStoreTest
         First = 1,
     }
 
+    [Generate]
     public class ApplicationInfo
     {
         public ApplicationsType Type { get; set; }
     }
 
+    [Generate]
     public class ApplicationInfoPropertyEnumTypeChanged
     {
         public ApplicationsRenamedType Type { get; set; }
@@ -504,6 +511,7 @@ public class EventStoreTest
         Assert.Equal(ApplicationsRenamedType.First, readApplicationInfo.Type);
     }
 
+    [Generate]
     public class UserEventList : IEquatable<UserEventList>
     {
         public long Id { get; set; }
@@ -547,7 +555,7 @@ public class EventStoreTest
         var appender = manager.AppendToStore(file);
         var userA = new User { Name = "A", Age = 1 };
         var userB = new User { Name = "B", Age = 2 };
-        var userEvent = new UserEventList { Id = 10, List = new List<User> { userA, userB, userA } };
+        var userEvent = new UserEventList { Id = 10, List = new() { userA, userB, userA } };
         appender.Store(null, new object[] { userEvent });
 
         manager = new EventStoreManager();
@@ -560,6 +568,7 @@ public class EventStoreTest
         Assert.Null(readUserEvent.User1);
     }
 
+    [Generate]
     public class UserEventDictionary : IEquatable<UserEventDictionary>
     {
         public long Id { get; set; }
@@ -619,6 +628,7 @@ public class EventStoreTest
         Assert.Equal(readUserEvent, userEvent);
     }
 
+    [Generate]
     public class ErrorInfo
     {
         public IDictionary<string, IList<ErrorInfo>> PropertyErrors { get; set; }
@@ -641,7 +651,7 @@ public class EventStoreTest
         var eventObserver = new StoringEventObserver();
         reader.ReadFromStartToEnd(eventObserver);
         var readUserEvent = (ErrorInfo)eventObserver.Events[0][0];
-        Assert.Equal(1, readUserEvent.PropertyErrors.Count);
+        Assert.Single(readUserEvent.PropertyErrors);
     }
 
     [Fact]
@@ -722,11 +732,13 @@ public class EventStoreTest
         }
     }
 
+    [Generate]
     public class SpecificList
     {
         public List<ulong> Ulongs { get; set; }
     }
 
+    [Generate]
     public class SpecificDictIList
     {
         public IDictionary<ulong, IList<ulong>> Dict { get; set; }
@@ -750,6 +762,7 @@ public class EventStoreTest
         appender.Store(null, new object[] { e1 });
     }
 
+    [Generate]
     public class UsersIList
     {
         public IList<User> Users { get; set; }
@@ -771,6 +784,7 @@ public class EventStoreTest
         public uint B { get; set; }
     }
 
+    [Generate]
     public class Ev1
     {
         public ClassWithChangedUINTtoULONG Credit { get; set; }
@@ -801,6 +815,7 @@ public class EventStoreTest
         }
     }
 
+    [Generate]
     public class EventDictionaryInDictionary
     {
         public Dictionary<string, IDictionary<string, string>> DictInDict { get; set; }
@@ -827,6 +842,7 @@ public class EventStoreTest
         reader.ReadFromStartToEnd(eventObserver);
     }
 
+    [Generate]
     public class EventWithIIndirect
     {
         public string Name { get; set; }
@@ -845,9 +861,9 @@ public class EventStoreTest
         {
             Name = "A",
             Ind1 = new DBIndirect<User>(),
-            Ind2 = new List<IIndirect<User>>()
+            Ind2 = new()
         };
-        appender.Store(null, new object[] { ev });
+        appender.Store(null, [ev]);
         manager = new EventStoreManager();
         var reader = manager.OpenReadOnlyStore(file);
         var eventObserver = new StoringEventObserver();
@@ -858,11 +874,13 @@ public class EventStoreTest
     {
     }
 
+    [Generate]
     public class SomethingWithList
     {
         public Dictionary<ulong, List<string>> B { get; set; }
     }
 
+    [Generate]
     public class SomethingWithNestedIList
     {
         public Dictionary<ulong, IList<string>> B { get; set; }
@@ -895,6 +913,7 @@ public class EventStoreTest
         reader.ReadFromStartToEnd(eventObserver);
     }
 
+    [Generate]
     public class SimpleWithIndexer
     {
         public string OddName { get; set; }
@@ -915,12 +934,13 @@ public class EventStoreTest
         Assert.Equal("o", ev[11]);
     }
 
+    [Generate]
     public class StrangeVisibilities
     {
-        public string A { get; internal set; }
-        public string B { get; private set; }
-        public string C { internal get; set; }
-        public string D { private get; set; }
+        public string? A { get; internal set; }
+        public string? B { get; private set; }
+        public string? C { internal get; set; }
+        public string? D { private get; set; }
     }
 
     [Fact]
@@ -938,6 +958,7 @@ public class EventStoreTest
         Assert.Equal("c", ev.C);
     }
 
+    [Generate]
     public class PureArray
     {
         public string[] A { get; set; }
@@ -984,6 +1005,7 @@ public class EventStoreTest
         Assert.Contains("Unsupported", e.Message);
     }
 
+    [Generate]
     public class EventWithNullable
     {
         public ulong EventId { get; set; }
@@ -1077,7 +1099,7 @@ public class EventStoreTest
         var userEvent = new UserEvent { Id = 10, User1 = user, User2 = user };
         var userEventMore = new UserEventMore { Id = 11, User1 = user, User2 = user };
 
-        appender.Store(null, new object[] { userEvent, userEventMore });
+        appender.Store(null, [userEvent, userEventMore]);
 
         manager = new EventStoreManager();
         manager.SetNewTypeNameMapper(new SelectiveTypeMapper("BTDBTest.EventStoreTest+UserEvent"));
@@ -1089,6 +1111,7 @@ public class EventStoreTest
         Assert.Same(readUserEvent.User1, readUserEvent.User2);
     }
 
+    [Generate]
     public class SomeSets
     {
         public ISet<string> A { get; set; }
@@ -1129,6 +1152,7 @@ public class EventStoreTest
         a.Store(null, new[] { new Dictionary<int, IList<bool>> { { 1, new[] { true } } } });
     }
 
+    [Generate]
     public class ObjWithReadOnlyMemory
     {
         public ReadOnlyMemory<byte> Data { get; set; }
@@ -1139,7 +1163,7 @@ public class EventStoreTest
     {
         var manager = new EventStoreManager();
         var appender = manager.AppendToStore(new MemoryEventFileStorage());
-        appender.Store(null, new object[] { new ObjWithReadOnlyMemory { Data = "ahoj"u8.ToArray() } });
+        appender.Store(null, [new ObjWithReadOnlyMemory { Data = "ahoj"u8.ToArray() }]);
         var eventObserver = new StoringEventObserver();
         appender.ReadFromStartToEnd(eventObserver);
         var ev = eventObserver.Events[0][0] as ObjWithReadOnlyMemory;
@@ -1150,6 +1174,8 @@ public class EventStoreTest
     {
     }
 
+    [GenerateFor(typeof(DynamicValueWrapper<Enum>))]
+    [GenerateFor(typeof(DynamicValueWrapper<Money>))]
     public class DynamicValueWrapper<TValueType> : IDynamicValue
     {
         public TValueType Value { get; set; }
@@ -1169,6 +1195,7 @@ public class EventStoreTest
         public string Code { get; init; }
     }
 
+    [Generate]
     public class Root
     {
         public List<IDynamicValue> R { get; set; }
@@ -1200,26 +1227,27 @@ public class EventStoreTest
         var usd = new Currency() { Code = "USD", MinorToAmountRatio = 100 };
         var obj = new Root()
         {
-            R = new List<IDynamicValue>()
-            {
-                new DynamicValueWrapper<Enum>() { Value = Test1.A },
-                new DynamicValueWrapper<Money>()
+            R =
+            [
+                new DynamicValueWrapper<Enum> { Value = Test1.A },
+                new DynamicValueWrapper<Money>
                 {
-                    Value = new Money()
+                    Value = new()
                     {
                         MinorValue = 10000,
                         Currency = usd
                     }
                 },
-                new DynamicValueWrapper<Money>()
+
+                new DynamicValueWrapper<Money>
                 {
-                    Value = new Money()
+                    Value = new()
                     {
                         MinorValue = 61000,
                         Currency = usd
                     }
                 }
-            }
+            ]
         };
 
         var obj2 = SerializationInternal<Root>(obj);

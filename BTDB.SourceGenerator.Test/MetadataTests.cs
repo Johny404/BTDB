@@ -10,6 +10,7 @@ public class MetadataTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator("""
+            using System;
             namespace TestNamespace;
 
             [BTDB.Generate]
@@ -58,6 +59,7 @@ public class MetadataTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator("""
+            using System;
             using System.Collections.Generic;
             namespace TestNamespace;
 
@@ -255,6 +257,440 @@ public class MetadataTests : GeneratorTestsBase
                     get => Number;
                     set => Number = value;
                 }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyDerivedClassWithoutNewFieldsHasMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public interface IChild
+            {
+                ulong Id { get; set; }
+            }
+
+            public class Child : IChild
+            {
+                public ulong Id { get; set; }
+            }
+
+            public class DerivedChild : Child
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyDerivedClassNewingIdenticalProperty()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class Child
+            {
+                public ulong Id { get; set; }
+            }
+
+            public class DerivedChild : Child
+            {
+               public new ulong Id { get; set; }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyDerivedGrandChildFromGeneratedClassHasMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class Child
+            {
+                public ulong Id { get; set; }
+            }
+
+            public class DerivedChild : Child
+            {
+            }
+
+            public class GrandChild : DerivedChild
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyDerivedClassFromGenericBaseUsesClosedOwnerTypeForMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class ElementOrderInfoBase<TId, TType>
+            {
+                public TId Id { get; set; }
+                public TType Type { get; set; }
+            }
+
+            public class JourneyMapElementOrderInfo : ElementOrderInfoBase<ulong, int>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyDerivedClassFromGenericBaseUsesAccessorAdaptersForMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            public abstract class CompanyMapKeyBase<TKey>
+            {
+                ulong _companyId;
+                TKey _id = default!;
+
+                public ulong CompanyId
+                {
+                    get => _companyId + 1;
+                    set => _companyId = value - 1;
+                }
+
+                public TKey Id
+                {
+                    get => _id;
+                    set => _id = value;
+                }
+            }
+
+            [BTDB.Generate]
+            public class ProgramStrategyKey : CompanyMapKeyBase<ulong>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyDerivedClassFromExternalGenericBaseUsesFieldAccessForAutoProperties()
+    {
+        // language=cs
+        // The base class SampleGenericBase<TKey> is in Sample3rdPartyLib (external assembly)
+        // with auto-properties: ulong CompanyId { get; set; } and TKey Id { get; set; }
+        return VerifySourceGenerator("""
+            [BTDB.Generate]
+            public class ConcreteKey : Sample3rdPartyLib.SampleGenericBase<ulong>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyDerivedClassFromBaseUsesAccessorMethodsForMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            public class Event
+            {
+                public ulong Id { get; set; }
+            }
+
+            [BTDB.Generate]
+            public class EventWithApiKey : Event
+            {
+                public string ApiKey { get; set; }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyIIndirectPropertyIsCorrectlyGenerated()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class Person
+            {
+                public BTDB.FieldHandler.IIndirect<Person> Friend { get; set; }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyNestedValueInIDictionaryIsRegistered()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            namespace BTDBTest;
+
+            public class ObjectDbEventSerializeTest
+            {
+                public class Item
+                {
+                    public ulong Id { get; set; }
+                    public string Name { get; set; }
+                }
+
+                public class ObjWithIDictionary
+                {
+                    [PrimaryKey(1)] public uint TenantId { get; set; }
+
+                    public IDictionary<ulong, Item> Dict { get; set; }
+                }
+
+                public interface IObjWithIDictionaryTable : IRelation<ObjWithIDictionary>
+                {
+                }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyNestedEmptyClassStillGenerateMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            namespace BTDBTest;
+
+            public class ObjInObjV2
+            {
+            }
+
+            public class RowObjInObjV2
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+                public ObjInObjV2 OO { get; set; }
+            }
+
+            public interface IRowObjInObjV2Table : IRelation<RowObjInObjV2>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyOnlyPublicInterfacesAreRegistered()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public interface IPublicInterface
+            {
+                string PublicProperty { get; set; }
+            }
+
+            internal interface IInternalInterface
+            {
+                string InternalProperty { get; set; }
+            }
+
+            public class Person : IPublicInterface, IInternalInterface
+            {
+                public string PublicProperty { get; set; } = "";
+                public string InternalProperty { get; set; } = "";
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyFuncDelegatesDoNotGenerateMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System;
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class Person
+            {
+                public string Name { get; set; } = "";
+                public Func<string, (int, int)> MyFunc { get; set; } = null!;
+                public Action<(string, int)> MyAction { get; set; } = null!;
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyTaskTypeDoNotGenerateMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Threading.Tasks;
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class Person
+            {
+                public string Name { get; set; } = "";
+                public Task<string> MyTask { get; set; } = null!;
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyValueTaskTypeDoNotGenerateMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Threading.Tasks;
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class Person
+            {
+                public string Name { get; set; } = "";
+                public ValueTask<string> MyValueTask { get; set; } = default;
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyValueTupleGeneratesMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class Person
+            {
+                public string Name { get; set; } = "";
+                public (int, string) MyTuple { get; set; } = default;
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyTupleGeneratesMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class Person
+            {
+                public string Name { get; set; } = "";
+                public System.Tuple<int, string> MyTuple { get; set; } = default!;
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyNullableItemInCollectionGeneratesMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class Person
+            {
+                public List<int?> NullableInts;
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyOrderedSetIntIsRegistered()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class Person
+            {
+                public OrderedSet<int> OrderedSetOfInts { get; set; }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyGenericClassMetadataGeneration()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            namespace TestNamespace;
+
+            [BTDB.GenerateFor(typeof(GenericClass<System.Enum>))]
+            public class GenericClass<T>
+            {
+                public T Value { get; set; }
+                public List<T> Values { get; set; }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyGenericClassWithComplexGetterSetterMetadataGeneration()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System;
+            using System.Collections.Generic;
+            namespace TestNamespace;
+
+            [BTDB.GenerateFor(typeof(GenericClass<System.Enum>))]
+            public class GenericClass<T>
+            {
+                public T Value
+                {
+                    get
+                    {
+                        Console.WriteLine("Hello");
+                        return default(T)!;
+                    }
+                    set
+                    {
+                        Console.WriteLine("World" + value);
+                    }
+                }
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task VerifyGenericClassWithConstrainsMetadataGeneration()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            namespace TestNamespace;
+
+            public interface ISomeType { }
+
+            public class SomeType : ISomeType { }
+
+            [BTDB.GenerateFor(typeof(GenericClass<SomeType>))]
+            public class GenericClass<T> where T : ISomeType, new()
+            {
+                public T Value { get; set; }
             }
             """);
     }

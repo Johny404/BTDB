@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using BTDB.Collections;
@@ -430,7 +429,7 @@ class BTreeLeafComp : IBTreeLeafNode, IBTreeNode
         stats.GetOrAddValueRef((depth, (uint)_keyValues.Length))++;
     }
 
-    public void FastIterate(int deepness, ref StructList<NodeIdxPair> stack, ref long keyIndex,
+    public bool FastIterate(int deepness, ref StructList<NodeIdxPair> stack, ref long keyIndex,
         CursorIterateCallback callback)
     {
         if (deepness == stack.Count)
@@ -440,11 +439,16 @@ class BTreeLeafComp : IBTreeLeafNode, IBTreeNode
 
         for (var i = stack.Last.Idx; i < _keyValues.Length; i++, stack.Last.Idx++)
         {
-            callback.Invoke(keyIndex, _keyBytes.AsSpan(_keyValues[i].KeyOffset, _keyValues[i].KeyLength));
+            if (callback.Invoke(keyIndex, _keyBytes.AsSpan(_keyValues[i].KeyOffset, _keyValues[i].KeyLength)))
+            {
+                return true;
+            }
+
             keyIndex++;
         }
 
         stack.Pop();
+        return false;
     }
 
     static void RecalculateOffsets(Member[] keyValues)

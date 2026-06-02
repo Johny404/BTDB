@@ -1,11 +1,12 @@
 using System;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace BTDB.KVDBLayer;
 
 public interface ICompactorScheduler
 {
-    Func<CancellationToken, bool> AddCompactAction(Func<CancellationToken, bool> compactAction);
-    void RemoveCompactAction(Func<CancellationToken, bool> compactAction);
-    void AdviceRunning(bool openingDb);
+    void AddCompactAction(IKeyValueDB keyValueDB);
+    void RemoveCompactAction(IKeyValueDB keyValueDB);
+    void AdviceRunning(IKeyValueDB keyValueDB, bool openingDb);
 }

@@ -1,9 +1,11 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using BTDB.FieldHandler;
 using BTDB.IL;
 using BTDB.KVDBLayer;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
 
 namespace BTDB.ODBLayer;
@@ -60,39 +62,24 @@ public class ODBSetFieldHandler : IFieldHandler, IFieldHandlerWithNestedFieldHan
     void CreateConfiguration()
     {
         HandledType();
-        var keyAndValueTypes = _type!.GetGenericArguments();
-        _configurationId = ODBDictionaryConfiguration.Register(_keysHandler, keyAndValueTypes[0], null, null);
-        var cfg = ODBDictionaryConfiguration.Get(_configurationId);
+        _configurationId = GetConfigurationId(_type!, null);
+    }
+
+    int GetConfigurationId(Type type, ITypeConverterFactory? typeConverterFactory)
+    {
+        var keyAndValueTypes = type.GetGenericArguments();
+        var configurationId =
+            ODBDictionaryConfiguration.Register(_keysHandler, keyAndValueTypes[0], null, null);
+        var cfg = ODBDictionaryConfiguration.Get(configurationId);
         lock (cfg)
         {
-            cfg.KeyReader ??= CreateReader(_keysHandler, keyAndValueTypes[0]);
-            cfg.KeyWriter ??= CreateWriter(_keysHandler, keyAndValueTypes[0]);
+            cfg.KeyReader ??= ODBDictionaryFieldHandler.CreateReader(_keysHandler, keyAndValueTypes[0],
+                typeConverterFactory, _typeConvertGenerator);
+            cfg.KeyWriter ??= ODBDictionaryFieldHandler.CreateWriter(_keysHandler, keyAndValueTypes[0],
+                typeConverterFactory, _typeConvertGenerator);
         }
-    }
 
-    object CreateWriter(IFieldHandler fieldHandler, Type realType)
-    {
-        //Action<T, ref MemWriter, IWriterCtx>
-        var delegateType = typeof(WriterFun<>).MakeGenericType(realType);
-        var dm = ILBuilder.Instance.NewMethod(fieldHandler.Name + "Writer", delegateType);
-        var ilGenerator = dm.Generator;
-        fieldHandler.Save(ilGenerator, il => il.Ldarg(1), il => il.Ldarg(2),
-            il => il.Ldarg(0).Do(_typeConvertGenerator.GenerateConversion(realType, fieldHandler.HandledType()!)!));
-        ilGenerator.Ret();
-        return dm.Create();
-    }
-
-    object CreateReader(IFieldHandler fieldHandler, Type realType)
-    {
-        //Func<ref MemReader, IReaderCtx, T>
-        var delegateType = typeof(ReaderFun<>).MakeGenericType(realType);
-        var dm = ILBuilder.Instance.NewMethod(fieldHandler.Name + "Reader", delegateType);
-        var ilGenerator = dm.Generator;
-        fieldHandler.Load(ilGenerator, il => il.Ldarg(0), il => il.Ldarg(1));
-        ilGenerator
-            .Do(_typeConvertGenerator.GenerateConversion(fieldHandler.HandledType()!, realType)!)
-            .Ret();
-        return dm.Create();
+        return configurationId;
     }
 
     public static string HandlerName => "ODBSet";
@@ -167,6 +154,21 @@ public class ODBSetFieldHandler : IFieldHandler, IFieldHandlerWithNestedFieldHan
             .Castclass(_type);
     }
 
+    public unsafe FieldHandlerInit Init()
+    {
+        var configuration = ODBDictionaryConfiguration.Get(_configurationId);
+        var collectionMetadata = ReflectionMetadata.FindCollectionByType(_type);
+        if (collectionMetadata == null)
+            throw new BTDBException("Cannot find collection metadata for " + _type.ToSimpleName());
+        var creator = collectionMetadata.ODBCreator;
+        return (IReaderCtx? ctx, ref byte value) =>
+        {
+            var transaction = ((IDBReaderCtx)ctx!).GetTransaction();
+            Unsafe.As<byte, object>(ref value) =
+                creator(transaction, configuration, transaction.AllocateDictionaryId());
+        };
+    }
+
     public void Skip(IILGen ilGenerator, Action<IILGen> pushReader, Action<IILGen>? pushCtx)
     {
         ilGenerator
@@ -184,6 +186,72 @@ public class ODBSetFieldHandler : IFieldHandler, IFieldHandlerWithNestedFieldHan
             .Do(pushValue)
             .LdcI4(_configurationId)
             .Call(instanceType.GetMethod(nameof(ODBSet<int>.DoSave))!);
+    }
+
+    public unsafe FieldHandlerLoad Load(Type asType, ITypeConverterFactory typeConverterFactory)
+    {
+        if (IsCompatibleWithStatic(asType, FieldHandlerOptions.None))
+        {
+            var genericArguments = asType!.GetGenericArguments();
+            var instanceType = typeof(ODBSet<>).MakeGenericType(genericArguments);
+            var configurationId = GetConfigurationId(asType, typeConverterFactory);
+            var configuration = ODBDictionaryConfiguration.Get(configurationId);
+            var collectionMetadata = ReflectionMetadata.FindCollectionByType(asType);
+            if (collectionMetadata == null)
+                throw new BTDBException("Cannot find collection metadata for " + asType.ToSimpleName());
+            var creator = collectionMetadata.ODBCreator;
+            return (ref MemReader reader, IReaderCtx? ctx, ref byte value) =>
+            {
+                var dictId = reader.ReadVUInt64();
+                Unsafe.As<byte, object>(ref value) = creator(((IDBReaderCtx)ctx!).GetTransaction(), configuration,
+                    dictId);
+            };
+        }
+
+        if (asType.IsGenericType && asType.GetGenericTypeDefinition() == typeof(HashSet<>))
+        {
+            var genericArguments = asType!.GetGenericArguments();
+            return this.BuildConvertingLoader(typeof(IOrderedSet<>).MakeGenericType(genericArguments), asType,
+                typeConverterFactory);
+        }
+
+        return this.BuildConvertingLoader(
+            typeof(IOrderedSet<>).MakeGenericType(_keysHandler.HandledType()!), asType,
+            typeConverterFactory);
+    }
+
+    public void Skip(ref MemReader reader, IReaderCtx? ctx)
+    {
+        reader.SkipVUInt64();
+    }
+
+    public unsafe FieldHandlerSave Save(Type asType, ITypeConverterFactory typeConverterFactory)
+    {
+        if (!IsCompatibleWithCore(asType))
+            throw new BTDBException("Type " + asType.ToSimpleName() +
+                                    " is not compatible with ODBSetFieldHandler.Save");
+        var configurationId = GetConfigurationId(asType, typeConverterFactory);
+        var configuration = ODBDictionaryConfiguration.Get(configurationId);
+        var collectionMetadata = ReflectionMetadata.FindCollectionByType(asType);
+        if (collectionMetadata == null)
+            throw new BTDBException("Cannot find collection metadata for " + asType.ToSimpleName());
+        var creator = collectionMetadata.ODBCreator;
+        return (ref MemWriter writer, IWriterCtx? ctx, ref byte value) =>
+        {
+            var writerCtx = (IDBWriterCtx)ctx!;
+            var list = Unsafe.As<byte, IEnumerable>(ref value);
+            if (list is IInternalODBSet goodDict)
+            {
+                writer.WriteVUInt64(goodDict.DictId);
+                return;
+            }
+
+            var transaction = writerCtx.GetTransaction();
+            var dictId = transaction.AllocateDictionaryId();
+            goodDict = (IInternalODBSet)creator(transaction, configuration, dictId);
+            goodDict.Upsert(list);
+            writer.WriteVUInt64(dictId);
+        };
     }
 
     public IFieldHandler SpecializeLoadForType(Type type, IFieldHandler? typeHandler, IFieldHandlerLogger? logger)
@@ -232,18 +300,15 @@ public class ODBSetFieldHandler : IFieldHandler, IFieldHandlerWithNestedFieldHan
         yield return _keysHandler;
     }
 
-    public NeedsFreeContent FreeContent(IILGen ilGenerator, Action<IILGen> pushReader, Action<IILGen> pushCtx)
+    public void FreeContent(ref MemReader reader, IReaderCtx? ctx)
     {
-        var fakeMethod = ILBuilder.Instance.NewMethod<Action>("Relation_fake");
-        var fakeGenerator = fakeMethod.Generator;
-        if (_keysHandler.FreeContent(fakeGenerator, _ => { }, _ => { }) == NeedsFreeContent.Yes)
+        ctx!.RegisterDict(reader.ReadVUInt64());
+    }
+
+    public bool DoesNeedFreeContent(HashSet<Type> visitedTypes)
+    {
+        if (_keysHandler.DoesNeedFreeContent(visitedTypes))
             throw new BTDBException("Not supported 'free content' in IOrderedSet");
-        ilGenerator
-            .Do(pushCtx)
-            .Castclass(typeof(IDBReaderCtx))
-            .Do(pushReader)
-            .Call(typeof(MemReader).GetMethod(nameof(MemReader.ReadVUInt64))!)
-            .Callvirt(() => default(IDBReaderCtx).RegisterDict(0ul));
-        return NeedsFreeContent.Yes;
+        return true;
     }
 }

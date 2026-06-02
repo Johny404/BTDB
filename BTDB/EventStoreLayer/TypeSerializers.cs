@@ -9,9 +9,19 @@ using System.Collections.Generic;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
+using System.Threading;
 using BTDB.Encrypted;
+using BTDB.Serialization;
 
 namespace BTDB.EventStoreLayer;
+
+public delegate void Layer2Loader(ref MemReader reader, ITypeBinaryDeserializerContext? ctx, ref byte value);
+
+public delegate void Layer2Skipper(ref MemReader reader, ITypeBinaryDeserializerContext? ctx);
+
+public delegate void Layer2Saver(ref MemWriter writer, ITypeBinarySerializerContext? ctx, ref byte value);
+
+public delegate void Layer2NewDescriptor(IDescriptorSerializerLiteContext ctx, ref byte value);
 
 public delegate object Layer1Loader(ref MemReader reader, ITypeBinaryDeserializerContext? ctx,
     ITypeSerializersId2LoaderMapping mapping, ITypeDescriptor descriptor);
@@ -26,39 +36,40 @@ public class TypeSerializers : ITypeSerializers
 
     readonly
         ConcurrentDictionary<ITypeDescriptor, Layer1Loader> _loaders =
-            new ConcurrentDictionary<ITypeDescriptor, Layer1Loader>(ReferenceEqualityComparer<ITypeDescriptor>
+            new(ReferenceEqualityComparer<ITypeDescriptor>
                 .Instance);
 
     readonly ConcurrentDictionary<(ITypeDescriptor, Type), Action<object, IDescriptorSerializerLiteContext>>
-        _newDescriptorSavers =
-            new ConcurrentDictionary<(ITypeDescriptor, Type), Action<object, IDescriptorSerializerLiteContext>>();
+        _newDescriptorSavers = new();
 
     readonly ConcurrentDictionary<ITypeDescriptor, bool> _descriptorSet =
-        new ConcurrentDictionary<ITypeDescriptor, bool>(ReferenceEqualityComparer<ITypeDescriptor>.Instance);
+        new(ReferenceEqualityComparer<ITypeDescriptor>.Instance);
 
-    ConcurrentDictionary<Type, ITypeDescriptor> _type2DescriptorMap =
-        new ConcurrentDictionary<Type, ITypeDescriptor>(ReferenceEqualityComparer<Type>.Instance);
+    ConcurrentDictionary<Type, ITypeDescriptor?> _type2DescriptorMap = new(ReferenceEqualityComparer<Type>.Instance);
 
-    readonly object _buildTypeLock = new object();
+    readonly Lock _buildTypeLock = new();
 
-    readonly ConcurrentDictionary<(ITypeDescriptor, Type), Layer1SimpleSaver> _simpleSavers =
-        new ConcurrentDictionary<(ITypeDescriptor, Type), Layer1SimpleSaver>();
+    readonly ConcurrentDictionary<(ITypeDescriptor, Type), Layer1SimpleSaver> _simpleSavers = new();
 
     readonly ConcurrentDictionary<(ITypeDescriptor, Type), Layer1ComplexSaver>
-        _complexSavers = new ConcurrentDictionary<(ITypeDescriptor, Type), Layer1ComplexSaver>();
+        _complexSavers = new();
 
     readonly Func<ITypeDescriptor, Layer1Loader> _loaderFactoryAction;
 
-    readonly Func<Type, ITypeDescriptor> _buildFromTypeAction;
+    readonly Func<Type, ITypeDescriptor?> _buildFromTypeAction;
     readonly ISymmetricCipher _symmetricCipher;
+    readonly ITypeConverterFactory _convertorFactory;
+    readonly bool _preserveDescriptors;
 
     public TypeSerializers(ITypeNameMapper? typeNameMapper = null, TypeSerializersOptions? options = null)
     {
         ConvertorGenerator = options?.ConvertorGenerator ?? DefaultTypeConvertorGenerator.Instance;
+        _convertorFactory = options?.ConvertorFactory ?? new DefaultTypeConverterFactory();
         _typeNameMapper = typeNameMapper ?? new FullNameTypeMapper();
         ForgotAllTypesAndSerializers();
         _loaderFactoryAction = LoaderFactory;
         _buildFromTypeAction = BuildFromType;
+        _preserveDescriptors = options?.PreserveDescriptors ?? true;
         Options = options ?? TypeSerializersOptions.Default;
         _symmetricCipher = Options.SymmetricCipher ?? new InvalidSymmetricCipher();
     }
@@ -70,10 +81,18 @@ public class TypeSerializers : ITypeSerializers
         _typeNameMapper = typeNameMapper ?? new FullNameTypeMapper();
     }
 
+    // Weak for Keys Dictionary is used here to avoid memory leak when object is not referenced anymore.
+    public static readonly ConditionalWeakTable<object, ITypeDescriptor> Object2DescriptorMap = new();
+
     public ITypeDescriptor? DescriptorOf(object? obj)
     {
         if (obj == null) return null;
-        if (obj is IKnowDescriptor knowDescriptor) return knowDescriptor.GetDescriptor();
+        if (_preserveDescriptors)
+        {
+            if (obj is IKnowDescriptor knowDescriptor) return knowDescriptor.GetDescriptor();
+            if (Object2DescriptorMap.TryGetValue(obj, out var descriptor)) return descriptor;
+        }
+
         return DescriptorOf(obj.GetType());
     }
 
@@ -95,7 +114,7 @@ public class TypeSerializers : ITypeSerializers
 
     ITypeDescriptor? BuildFromType(Type type)
     {
-        ITypeDescriptor result;
+        ITypeDescriptor? result;
         lock (_buildTypeLock)
         {
             var buildFromTypeCtx = new BuildFromTypeCtx(this, _type2DescriptorMap, Options);
@@ -113,10 +132,10 @@ public class TypeSerializers : ITypeSerializers
         readonly TypeSerializers _typeSerializers;
         readonly ConcurrentDictionary<Type, ITypeDescriptor> _type2DescriptorMap;
         readonly TypeSerializersOptions _typeSerializersOptions;
-        readonly Dictionary<Type, ITypeDescriptor> _temporaryMap = new Dictionary<Type, ITypeDescriptor>();
+        readonly Dictionary<Type, ITypeDescriptor> _temporaryMap = new();
 
         readonly Dictionary<ITypeDescriptor, ITypeDescriptor> _remap =
-            new Dictionary<ITypeDescriptor, ITypeDescriptor>(ReferenceEqualityComparer<ITypeDescriptor>.Instance);
+            new(ReferenceEqualityComparer<ITypeDescriptor>.Instance);
 
         public BuildFromTypeCtx(TypeSerializers typeSerializers,
             ConcurrentDictionary<Type, ITypeDescriptor> type2DescriptorMap,
@@ -136,6 +155,7 @@ public class TypeSerializers : ITypeSerializers
             {
                 throw new BTDBException("Lazy DB object serialization is forbidden. Type: " + type.ToSimpleName());
             }
+
             if (!type.IsSubclassOf(typeof(Delegate)))
             {
                 if (type.IsGenericType)
@@ -268,7 +288,7 @@ public class TypeSerializers : ITypeSerializers
 
         _descriptorSet.Clear();
         _type2DescriptorMap =
-            new ConcurrentDictionary<Type, ITypeDescriptor>(EnumDefaultTypes(),
+            new(EnumDefaultTypes(),
                 ReferenceEqualityComparer<Type>.Instance);
     }
 
@@ -276,12 +296,12 @@ public class TypeSerializers : ITypeSerializers
     {
         foreach (var predefinedType in BasicSerializersFactory.TypeDescriptors)
         {
-            yield return new KeyValuePair<Type, ITypeDescriptor>(predefinedType.GetPreferredType(), predefinedType);
+            yield return new(predefinedType.GetPreferredType(), predefinedType);
             var descriptorMultipleNativeTypes = predefinedType as ITypeDescriptorMultipleNativeTypes;
             if (descriptorMultipleNativeTypes == null) continue;
             foreach (var type in descriptorMultipleNativeTypes.GetNativeTypes())
             {
-                yield return new KeyValuePair<Type, ITypeDescriptor>(type, predefinedType);
+                yield return new(type, predefinedType);
             }
         }
     }
@@ -293,7 +313,7 @@ public class TypeSerializers : ITypeSerializers
 
     Layer1Loader LoaderFactory(ITypeDescriptor descriptor)
     {
-        Type loadAsType = null;
+        Type? loadAsType = null;
         try
         {
             loadAsType = LoadAsType(descriptor);
@@ -302,53 +322,111 @@ public class TypeSerializers : ITypeSerializers
         {
         }
 
-        var methodBuilder = ILBuilder.Instance.NewMethod<Layer1Loader>("DeserializerFor" + descriptor.Name);
-        var il = methodBuilder.Generator;
-        if (descriptor.AnyOpNeedsCtx())
+#pragma warning disable CS0162 // Unreachable code detected
+        if (IFieldHandler.UseNoEmitForDescriptors)
         {
-            var localCtx = il.DeclareLocal(typeof(ITypeBinaryDeserializerContext), "ctx");
-            var haveCtx = il.DefineLabel();
-            il
-                .Ldarg(1)
-                .Dup()
-                .Stloc(localCtx)
-                .Brtrue(haveCtx)
-                .Ldarg(2)
-                // ReSharper disable once ObjectCreationAsStatement
-                .Newobj(() => new DeserializerCtx(null))
-                .Castclass(typeof(ITypeBinaryDeserializerContext))
-                .Stloc(localCtx)
-                .Mark(haveCtx);
-            if (loadAsType == null)
-                descriptor.GenerateSkip(il, ilGen => ilGen.Ldarg(0), ilGen => ilGen.Ldloc(localCtx));
+            if (descriptor.AnyOpNeedsCtx())
+            {
+                if (loadAsType == null)
+                {
+                    return (ref reader, ctx, mapping, typeDescriptor) =>
+                    {
+                        var localCtx = ctx ?? new DeserializerCtx(mapping);
+                        descriptor.Skip(ref reader, localCtx);
+                        return null!;
+                    };
+                }
+                else
+                {
+                    var loader = loadAsType == typeof(object)
+                        ? descriptor.GenerateLoad(loadAsType, _convertorFactory)
+                        : descriptor
+                            .BuildConvertingLoader(loadAsType, typeof(object), _convertorFactory);
+                    return (ref reader, ctx, mapping, typeDescriptor) =>
+                    {
+                        var localCtx = ctx ?? new DeserializerCtx(mapping);
+                        object res = null;
+                        loader(ref reader, localCtx, ref Unsafe.As<object, byte>(ref res));
+                        return res;
+                    };
+                }
+            }
             else
-                descriptor.GenerateLoad(il, ilGen => ilGen.Ldarg(0), ilGen => ilGen.Ldloc(localCtx),
-                    ilGen => ilGen.Ldarg(3), loadAsType);
+            {
+                if (loadAsType == null)
+                {
+                    return (ref reader, ctx, mapping, typeDescriptor) =>
+                    {
+                        descriptor.Skip(ref reader, ctx);
+                        return null!;
+                    };
+                }
+                else
+                {
+                    var loader = loadAsType == typeof(object)
+                        ? descriptor.GenerateLoad(loadAsType, _convertorFactory)
+                        : descriptor
+                            .BuildConvertingLoader(loadAsType, typeof(object), _convertorFactory);
+                    return (ref reader, ctx, mapping, typeDescriptor) =>
+                    {
+                        object res = null;
+                        loader(ref reader, ctx, ref Unsafe.As<object, byte>(ref res));
+                        return res;
+                    };
+                }
+            }
         }
         else
         {
-            if (loadAsType == null)
-                descriptor.GenerateSkip(il, ilGen => ilGen.Ldarg(0), ilGen => ilGen.Ldarg(1));
+            var methodBuilder = ILBuilder.Instance.NewMethod<Layer1Loader>("DeserializerFor" + descriptor.Name);
+            var il = methodBuilder.Generator;
+            if (descriptor.AnyOpNeedsCtx())
+            {
+                var localCtx = il.DeclareLocal(typeof(ITypeBinaryDeserializerContext), "ctx");
+                var haveCtx = il.DefineLabel();
+                il
+                    .Ldarg(1)
+                    .Dup()
+                    .Stloc(localCtx)
+                    .Brtrue(haveCtx)
+                    .Ldarg(2)
+                    // ReSharper disable once ObjectCreationAsStatement
+                    .Newobj(() => new DeserializerCtx(null))
+                    .Castclass(typeof(ITypeBinaryDeserializerContext))
+                    .Stloc(localCtx)
+                    .Mark(haveCtx);
+                if (loadAsType == null)
+                    descriptor.GenerateSkip(il, ilGen => ilGen.Ldarg(0), ilGen => ilGen.Ldloc(localCtx));
+                else
+                    descriptor.GenerateLoad(il, ilGen => ilGen.Ldarg(0), ilGen => ilGen.Ldloc(localCtx),
+                        ilGen => ilGen.Ldarg(3), loadAsType);
+            }
             else
-                descriptor.GenerateLoad(il, ilGen => ilGen.Ldarg(0), ilGen => ilGen.Ldarg(1),
-                    ilGen => ilGen.Ldarg(3), loadAsType);
-        }
+            {
+                if (loadAsType == null)
+                    descriptor.GenerateSkip(il, ilGen => ilGen.Ldarg(0), ilGen => ilGen.Ldarg(1));
+                else
+                    descriptor.GenerateLoad(il, ilGen => ilGen.Ldarg(0), ilGen => ilGen.Ldarg(1),
+                        ilGen => ilGen.Ldarg(3), loadAsType);
+            }
 
-        if (loadAsType == null)
-        {
-            il.Ldnull();
-        }
-        else if (loadAsType.IsValueType)
-        {
-            il.Box(loadAsType);
-        }
-        else if (loadAsType != typeof(object))
-        {
-            il.Castclass(typeof(object));
-        }
+            if (loadAsType == null)
+            {
+                il.Ldnull();
+            }
+            else if (loadAsType.IsValueType)
+            {
+                il.Box(loadAsType);
+            }
+            else if (loadAsType != typeof(object))
+            {
+                il.Castclass(typeof(object));
+            }
 
-        il.Ret();
-        return methodBuilder.Create();
+            il.Ret();
+            return methodBuilder.Create();
+        }
+#pragma warning restore CS0162 // Unreachable code detected
     }
 
     public Type LoadAsType(ITypeDescriptor descriptor)
@@ -361,10 +439,12 @@ public class TypeSerializers : ITypeSerializers
         return descriptor.GetPreferredType(targetType) ?? NameToType(descriptor.Name!) ?? typeof(object);
     }
 
+    public bool PreserveDescriptors => _preserveDescriptors;
+
     class DeserializerCtx : ITypeBinaryDeserializerContext
     {
         readonly ITypeSerializersId2LoaderMapping _mapping;
-        readonly List<object> _backRefs = new List<object>();
+        readonly List<object> _backRefs = new();
 
         public DeserializerCtx(ITypeSerializersId2LoaderMapping mapping)
         {
@@ -443,23 +523,35 @@ public class TypeSerializers : ITypeSerializers
         return _simpleSavers.GetOrAdd((descriptor, type), NewSimpleSaver);
     }
 
-    static Layer1SimpleSaver? NewSimpleSaver((ITypeDescriptor descriptor, Type type) v)
+    Layer1SimpleSaver? NewSimpleSaver((ITypeDescriptor descriptor, Type type) v)
     {
         var (descriptor, type) = v;
         if (descriptor.AnyOpNeedsCtx()) return null;
-        var method =
-            ILBuilder.Instance.NewMethod<Layer1SimpleSaver>(descriptor.Name + "SimpleSaver");
-        var il = method.Generator;
-        descriptor.GenerateSave(il, ilgen => ilgen.Ldarg(0), null, ilgen =>
+        if (IFieldHandler.UseNoEmitForDescriptors)
+#pragma warning disable CS0162 // Unreachable code detected
         {
-            ilgen.Ldarg(1);
-            if (type != typeof(object))
+            var saver = typeof(object) == type
+                ? descriptor.GenerateSave(type, _convertorFactory)
+                : descriptor.BuildConvertingSaver(typeof(object), type, _convertorFactory);
+            return (ref writer, value) => { saver(ref writer, null, ref Unsafe.As<object, byte>(ref value)); };
+        }
+        else
+        {
+            var method =
+                ILBuilder.Instance.NewMethod<Layer1SimpleSaver>(descriptor.Name + "SimpleSaver");
+            var il = method.Generator;
+            descriptor.GenerateSave(il, ilgen => ilgen.Ldarg(0), null, ilgen =>
             {
-                ilgen.UnboxAny(type);
-            }
-        }, type);
-        il.Ret();
-        return method.Create();
+                ilgen.Ldarg(1);
+                if (type != typeof(object))
+                {
+                    ilgen.UnboxAny(type);
+                }
+            }, type);
+            il.Ret();
+            return method.Create();
+        }
+#pragma warning restore CS0162 // Unreachable code detected
     }
 
     public Layer1ComplexSaver GetComplexSaver(ITypeDescriptor descriptor, Type type)
@@ -467,21 +559,33 @@ public class TypeSerializers : ITypeSerializers
         return _complexSavers.GetOrAdd((descriptor, type), NewComplexSaver);
     }
 
-    static Layer1ComplexSaver NewComplexSaver((ITypeDescriptor descriptor, Type type) v)
+    Layer1ComplexSaver NewComplexSaver((ITypeDescriptor descriptor, Type type) v)
     {
         var (descriptor, type) = v;
-        var method = ILBuilder.Instance.NewMethod<Layer1ComplexSaver>(descriptor.Name + "ComplexSaver");
-        var il = method.Generator;
-        descriptor.GenerateSave(il, ilgen => ilgen.Ldarg(0), ilgen => ilgen.Ldarg(1), ilgen =>
+#pragma warning disable CS0162 // Unreachable code detected
+        if (IFieldHandler.UseNoEmitForDescriptors)
         {
-            ilgen.Ldarg(2);
-            if (type != typeof(object))
+            var saver = typeof(object) == type
+                ? descriptor.GenerateSave(type, _convertorFactory)
+                : descriptor.BuildConvertingSaver(typeof(object), type, _convertorFactory);
+            return (ref writer, ctx, value) => { saver(ref writer, ctx, ref Unsafe.As<object, byte>(ref value)); };
+        }
+        else
+        {
+            var method = ILBuilder.Instance.NewMethod<Layer1ComplexSaver>(descriptor.Name + "ComplexSaver");
+            var il = method.Generator;
+            descriptor.GenerateSave(il, ilgen => ilgen.Ldarg(0), ilgen => ilgen.Ldarg(1), ilgen =>
             {
-                ilgen.UnboxAny(type);
-            }
-        }, type);
-        il.Ret();
-        return method.Create();
+                ilgen.Ldarg(2);
+                if (type != typeof(object))
+                {
+                    ilgen.UnboxAny(type);
+                }
+            }, type);
+            il.Ret();
+            return method.Create();
+        }
+#pragma warning restore CS0162 // Unreachable code detected
     }
 
     public Action<object, IDescriptorSerializerLiteContext>? GetNewDescriptorSaver(ITypeDescriptor descriptor,
@@ -490,29 +594,79 @@ public class TypeSerializers : ITypeSerializers
         return _newDescriptorSavers.GetOrAdd((descriptor, preciseType), NewDescriptorSaverFactory);
     }
 
-    static Action<object, IDescriptorSerializerLiteContext>? NewDescriptorSaverFactory(
+    struct ObjectSerializerCtx
+    {
+        internal nint StoragePtr;
+        internal IDescriptorSerializerLiteContext Ctx;
+        internal object Obj;
+        internal Layer2NewDescriptor OriginalGenerator;
+        internal Converter UnboxConverter;
+    }
+
+    unsafe Action<object, IDescriptorSerializerLiteContext>? NewDescriptorSaverFactory(
         (ITypeDescriptor descriptor, Type type) pair)
     {
-        var gen = pair.descriptor.BuildNewDescriptorGenerator();
-        if (gen == null)
+        if (IFieldHandler.UseNoEmitForDescriptors)
+#pragma warning disable CS0162 // Unreachable code detected
         {
-            return null;
-        }
-
-        var method =
-            ILBuilder.Instance.NewMethod<Action<object, IDescriptorSerializerLiteContext>>(
-                "GatherAllObjectsForTypeExtraction_" + pair.descriptor.Name);
-        var il = method.Generator;
-        gen.GenerateTypeIterator(il, ilgen =>
-        {
-            ilgen.Ldarg(0);
+            var newDescriptor =
+                pair.descriptor.GenerateNewDescriptor(pair.type, _convertorFactory,
+                    Options.ForbidSerializeLazyDBObjects);
+            if (newDescriptor == null)
+                return null;
             if (pair.type.IsValueType)
             {
-                ilgen.UnboxAny(pair.type);
+                var unbox = _convertorFactory.GetConverter(typeof(object), pair.type)!;
+                var originalGenerator = newDescriptor;
+                var stackAllocator = ReflectionMetadata.FindStackAllocatorByType(pair.type);
+                return (obj, ctx) =>
+                {
+                    ObjectSerializerCtx context;
+                    context.StoragePtr = 0;
+                    context.Ctx = ctx;
+                    context.Obj = obj;
+                    context.OriginalGenerator = originalGenerator;
+                    context.UnboxConverter = unbox;
+
+                    stackAllocator(ref Unsafe.As<ObjectSerializerCtx, byte>(ref context), ref context.StoragePtr,
+                        &Nested);
+
+                    static void Nested(ref byte value)
+                    {
+                        ref var context = ref Unsafe.As<byte, ObjectSerializerCtx>(ref value);
+                        context.UnboxConverter(ref Unsafe.As<object, byte>(ref context.Obj),
+                            ref Unsafe.AsRef<byte>((void*)context.StoragePtr));
+                        context.OriginalGenerator(context.Ctx, ref Unsafe.AsRef<byte>((void*)context.StoragePtr));
+                    }
+                };
             }
-        }, ilgen => ilgen.Ldarg(1), pair.type);
-        il.Ret();
-        return method.Create();
+
+            return (obj, ctx) => { newDescriptor(ctx, ref Unsafe.As<object, byte>(ref obj)); };
+        }
+        else
+        {
+            var gen = pair.descriptor.BuildNewDescriptorGenerator();
+            if (gen == null)
+            {
+                return null;
+            }
+
+            var method =
+                ILBuilder.Instance.NewMethod<Action<object, IDescriptorSerializerLiteContext>>(
+                    "GatherAllObjectsForTypeExtraction_" + pair.descriptor.Name);
+            var il = method.Generator;
+            gen.GenerateTypeIterator(il, ilgen =>
+            {
+                ilgen.Ldarg(0);
+                if (pair.type.IsValueType)
+                {
+                    ilgen.UnboxAny(pair.type);
+                }
+            }, ilgen => ilgen.Ldarg(1), pair.type);
+            il.Ret();
+            return method.Create();
+        }
+#pragma warning restore CS0162 // Unreachable code detected
     }
 
     public ITypeSerializersMapping CreateMapping()

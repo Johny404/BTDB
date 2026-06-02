@@ -10,6 +10,17 @@ static class Program
 {
     static void Main(string[] args)
     {
+        if (args.Length > 0 && string.Equals(args[0], "ioc-benchmark", StringComparison.OrdinalIgnoreCase))
+        {
+            BenchmarkSwitcher.FromTypes([typeof(IocResolveBenchmark)]).Run(args[1..]);
+            return;
+        }
+        if (args.Length > 0 && string.Equals(args[0], "roaring-benchmark", StringComparison.OrdinalIgnoreCase))
+        {
+            BenchmarkSwitcher.FromTypes([typeof(RoaringBitmapsBenchmark)]).Run(args[1..]);
+            return;
+        }
+
         //var b = new EventSerializationBenchmark();
         //b.Complexity = "Complex";
         //if (MemoryProfiler.IsActive && MemoryProfiler.CanControlAllocations)
@@ -25,7 +36,7 @@ static class Program
         //new RxSpeedTest().Run();
         //new ComplexServiceTest().Run();
         //new KeyValueSpeedTest(KVType.Managed, false, true).Run();
-        //new KeyValueSpeedTest(KVType.BTree, false, true).Run();
+        new KeyValueSpeedTest(KVType.BTree, false, true).Run();
         //new EventStorageSpeedTestAwaitable().Run();
         //new EventStorageSpeedTestDisruptor().Run();
         //new EventStorageSpeedTest().Run();
@@ -52,6 +63,6 @@ static class Program
         //Console.CancelKeyPress += delegate { cts.Cancel(); };
         //new AutoSplitSizeTest().Run("/tmp/db", cts.Token);
         //BenchmarkRunner.Run<BenchLockTest>();
-        new GatherSpeedTest().Run();
+        //new GatherSpeedTest().Run();
     }
 }

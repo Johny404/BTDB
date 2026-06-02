@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
 using BTDB.IL;
+using BTDB.Serialization;
+using BTDB.StreamLayer;
 
 namespace BTDB.FieldHandler;
 
@@ -7,7 +10,7 @@ public class ForbidOrderableFloatsFieldHandler : IFieldHandler
 {
     public string Name => "ForbidOrderableFloats";
     public byte[]? Configuration => null;
-    
+
     public bool IsCompatibleWith(Type type, FieldHandlerOptions options)
     {
         if ((options & FieldHandlerOptions.Orderable) == 0) return false;
@@ -38,7 +41,27 @@ public class ForbidOrderableFloatsFieldHandler : IFieldHandler
         throw new NotSupportedException();
     }
 
-    public NeedsFreeContent FreeContent(IILGen ilGenerator, Action<IILGen> pushReader, Action<IILGen>? pushCtx)
+    public FieldHandlerLoad Load(Type asType, ITypeConverterFactory typeConverterFactory)
+    {
+        throw new NotSupportedException();
+    }
+
+    public void Skip(ref MemReader reader, IReaderCtx? ctx)
+    {
+        throw new NotSupportedException();
+    }
+
+    public FieldHandlerSave Save(Type asType, ITypeConverterFactory typeConverterFactory)
+    {
+        throw new NotSupportedException();
+    }
+
+    public void FreeContent(ref MemReader reader, IReaderCtx? ctx)
+    {
+        throw new NotSupportedException();
+    }
+
+    public bool DoesNeedFreeContent(HashSet<Type> visitedTypes)
     {
         throw new NotSupportedException();
     }

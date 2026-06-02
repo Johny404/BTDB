@@ -4,6 +4,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using BTDB.IL;
+using BTDB.KVDBLayer;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
 
 namespace BTDB.FieldHandler;
@@ -226,6 +228,142 @@ public class DictionaryFieldHandler : IFieldHandler, IFieldHandlerWithNestedFiel
             .Mark(realFinish);
     }
 
+    ref struct DictionaryKeyValueLoaderCtx
+    {
+        internal nint KeyStoragePtr;
+        internal nint ValueStoragePtr;
+        internal object Object;
+        internal FieldHandlerLoad KeyLoader;
+        internal FieldHandlerLoad ValueLoader;
+        internal unsafe delegate*<object, ref byte, ref byte, void> Adder;
+        internal IReaderCtx Ctx;
+        internal ref MemReader Reader;
+        internal unsafe delegate*<ref byte, ref IntPtr, delegate*<ref byte, void>, void> ValueStackAllocator;
+    }
+
+    public unsafe FieldHandlerLoad Load(Type asType, ITypeConverterFactory typeConverterFactory)
+    {
+        var collectionMetadata = ReflectionMetadata.FindCollectionByType(asType!);
+        if (collectionMetadata == null)
+            throw new BTDBException("Cannot find collection metadata for " + _type.ToSimpleName());
+        var keyLoad = _keysHandler.Load(collectionMetadata.ElementKeyType, typeConverterFactory);
+        var keyStackAllocator = ReflectionMetadata.FindStackAllocatorByType(collectionMetadata.ElementKeyType);
+        var valueLoad = _valuesHandler.Load(collectionMetadata.ElementValueType!, typeConverterFactory);
+        var valueStackAllocator =
+            ReflectionMetadata.FindStackAllocatorByType(collectionMetadata.ElementValueType!);
+
+        return (ref MemReader reader, IReaderCtx? ctx, ref byte value) =>
+        {
+            if (ctx!.ReadObject(ref reader, out var obj))
+            {
+                var count = reader.ReadVUInt32();
+                obj = collectionMetadata!.Creator(count);
+                ctx.RegisterObject(obj);
+                var loaderCtx = new DictionaryKeyValueLoaderCtx
+                {
+                    Adder = collectionMetadata.AdderKeyValue,
+                    KeyLoader = keyLoad,
+                    ValueLoader = valueLoad,
+                    Object = obj,
+                    Ctx = ctx,
+                    Reader = ref reader,
+                    ValueStackAllocator = valueStackAllocator,
+                };
+                for (var i = 0; i != count; i++)
+                {
+                    keyStackAllocator(ref Unsafe.As<DictionaryKeyValueLoaderCtx, byte>(ref loaderCtx),
+                        ref loaderCtx.KeyStoragePtr,
+                        &NestedValue);
+
+                    static void NestedValue(ref byte value)
+                    {
+                        ref var context = ref Unsafe.As<byte, DictionaryKeyValueLoaderCtx>(ref value);
+                        context.ValueStackAllocator(ref value, ref context.ValueStoragePtr, &Nested);
+                    }
+
+                    static void Nested(ref byte value)
+                    {
+                        ref var context = ref Unsafe.As<byte, DictionaryKeyValueLoaderCtx>(ref value);
+                        context.KeyLoader(ref context.Reader, context.Ctx,
+                            ref Unsafe.AsRef<byte>((void*)context.KeyStoragePtr));
+                        context.ValueLoader(ref context.Reader, context.Ctx,
+                            ref Unsafe.AsRef<byte>((void*)context.ValueStoragePtr));
+                        context.Adder(context.Object, ref Unsafe.AsRef<byte>((void*)context.KeyStoragePtr),
+                            ref Unsafe.AsRef<byte>((void*)context.ValueStoragePtr));
+                    }
+                }
+
+                ctx.ReadObjectDone(ref reader);
+            }
+            else
+            {
+                if (obj == null || !asType!.IsAssignableFrom(obj.GetType()))
+                {
+                    obj = null;
+                }
+            }
+
+            Unsafe.As<byte, object?>(ref value) = obj;
+        };
+    }
+
+    public void Skip(ref MemReader reader, IReaderCtx? ctx)
+    {
+        if (ctx!.SkipObject(ref reader))
+        {
+            var count = reader.ReadVUInt32();
+            for (var i = 0; i < count; i++)
+            {
+                _keysHandler.Skip(ref reader, ctx);
+                _valuesHandler.Skip(ref reader, ctx);
+            }
+        }
+    }
+
+    public FieldHandlerSave Save(Type asType, ITypeConverterFactory typeConverterFactory)
+    {
+        if (!IsCompatibleWith(asType))
+            throw new InvalidOperationException("DictionaryFieldHandler cannot save " + asType.ToSimpleName());
+        var keyType = asType.GenericTypeArguments[0];
+        var valueType = asType.GenericTypeArguments[1];
+        var dictType = typeof(Dictionary<,>).MakeGenericType(asType.GenericTypeArguments);
+        var saveKey = _keysHandler.Save(keyType, typeConverterFactory);
+        var saveValue = _valuesHandler.Save(valueType, typeConverterFactory);
+        var layout = RawData.GetDictionaryEntriesLayout(keyType, valueType);
+        return (ref MemWriter writer, IWriterCtx? ctx, ref byte value) =>
+        {
+            var obj = Unsafe.As<byte, object>(ref value);
+            if (ctx!.WriteObject(ref writer, obj))
+            {
+                var objType = obj.GetType();
+                if (dictType.IsAssignableFrom(objType))
+                {
+                    var countFieldOffset =
+                        RawData.Align(8 + 6 * (uint)Unsafe.SizeOf<nint>(), 8);
+                    var count = Unsafe.As<byte, int>(ref RawData.Ref(obj, countFieldOffset));
+                    var freeCount = Unsafe.As<byte, int>(ref RawData.Ref(obj, countFieldOffset + 8));
+                    writer.WriteVUInt32((uint)(count - freeCount));
+                    if (count == 0) return;
+                    obj = RawData.HashSetEntries(Unsafe.As<HashSet<object>>(obj));
+                    ref readonly var mt = ref RawData.MethodTableRef(obj);
+                    var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                    var offsetDelta = mt.ComponentSize;
+                    for (var i = 0; i < count; i++, offset += offsetDelta)
+                    {
+                        if (Unsafe.As<byte, int>(ref RawData.Ref(obj, offset + layout.OffsetNext)) < -1)
+                        {
+                            continue;
+                        }
+
+                        saveKey(ref writer, ctx, ref RawData.Ref(obj, offset + layout.OffsetKey));
+                        saveValue(ref writer, ctx, ref RawData.Ref(obj, offset + layout.OffsetValue));
+                    }
+                }
+                else throw new BTDBException("Cannot save type " + objType.ToSimpleName());
+            }
+        };
+    }
+
     public IFieldHandler SpecializeLoadForType(Type type, IFieldHandler? typeHandler, IFieldHandlerLogger? logger)
     {
         if (_type == type) return this;
@@ -300,32 +438,21 @@ public class DictionaryFieldHandler : IFieldHandler, IFieldHandlerWithNestedFiel
         yield return _valuesHandler;
     }
 
-    public NeedsFreeContent FreeContent(IILGen ilGenerator, Action<IILGen> pushReader, Action<IILGen> pushCtx)
+    public void FreeContent(ref MemReader reader, IReaderCtx? ctx)
     {
-        var needsFreeContent = NeedsFreeContent.No;
-        var localCount = ilGenerator.DeclareLocal(typeof(uint));
-        var finish = ilGenerator.DefineLabel();
-        var next = ilGenerator.DefineLabel();
-        ilGenerator
-            .Do(pushCtx)
-            .Do(pushReader)
-            .Callvirt(typeof(IReaderCtx).GetMethod(nameof(IReaderCtx.SkipObject))!)
-            .Brfalse(finish)
-            .Do(pushReader)
-            .Call(typeof(MemReader).GetMethod(nameof(MemReader.ReadVUInt32))!)
-            .Stloc(localCount)
-            .Mark(next)
-            .Ldloc(localCount)
-            .Brfalse(finish)
-            .Ldloc(localCount)
-            .LdcI4(1)
-            .Sub()
-            .ConvU4()
-            .Stloc(localCount)
-            .GenerateFreeContent(_keysHandler, pushReader, pushCtx, ref needsFreeContent)
-            .GenerateFreeContent(_valuesHandler, pushReader, pushCtx, ref needsFreeContent)
-            .Br(next)
-            .Mark(finish);
-        return needsFreeContent;
+        if (ctx!.SkipObject(ref reader))
+        {
+            var count = reader.ReadVUInt32();
+            for (var i = 0; i < count; i++)
+            {
+                _keysHandler.FreeContent(ref reader, ctx);
+                _valuesHandler.FreeContent(ref reader, ctx);
+            }
+        }
+    }
+
+    public bool DoesNeedFreeContent(HashSet<Type> visitedTypes)
+    {
+        return _keysHandler.DoesNeedFreeContent(visitedTypes) || _valuesHandler.DoesNeedFreeContent(visitedTypes);
     }
 }

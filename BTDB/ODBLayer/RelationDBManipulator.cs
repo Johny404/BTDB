@@ -9,6 +9,7 @@ using BTDB.Buffer;
 using BTDB.Collections;
 using BTDB.IL;
 using BTDB.KVDBLayer;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
 
 namespace BTDB.ODBLayer;
@@ -31,6 +32,7 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
 
     public IInternalObjectDBTransaction Transaction => _transaction;
     public RelationInfo RelationInfo => _relationInfo;
+    protected ReadOnlySpan<TableFieldInfo> ValueFields => _relationInfo.ClientRelationVersionInfo.Fields.Span;
 
     const string AssertNotDerivedTypesMsg = "Derived types are not supported.";
 
@@ -40,6 +42,36 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
         _kvtr = _transaction.KeyValueDBTransaction;
         _relationInfo = relationInfo;
         _hasSecondaryIndexes = _relationInfo.ClientRelationVersionInfo.HasSecondaryIndexes;
+    }
+
+    [SkipLocalsInit]
+    public ulong AllocateId()
+    {
+        Span<byte> keyBuffer = stackalloc byte[16];
+        var keyWriter = MemWriter.CreateFromStackAllocatedSpan(keyBuffer);
+        keyWriter.WriteBlock(ObjectDB.RelationLastAllocatedIdPrefix);
+        keyWriter.WriteVUInt32(_relationInfo.Id);
+        var key = keyWriter.GetSpan();
+
+        using var cursor = _kvtr.CreateCursor();
+        Span<byte> valueBuffer = stackalloc byte[16];
+        var found = cursor.FindFirstKey(key);
+        var lastAllocatedId = found ? PackUnpack.UnpackVUInt(cursor.GetValueSpan(ref valueBuffer)) : 0;
+        var allocatedId = checked(lastAllocatedId + 1);
+
+        var valueLength = PackUnpack.LengthVUInt(allocatedId);
+        PackUnpack.UnsafePackVUInt(ref MemoryMarshal.GetReference(valueBuffer), allocatedId, valueLength);
+        var value = valueBuffer[..(int)valueLength];
+        if (found)
+        {
+            cursor.SetValue(value);
+        }
+        else
+        {
+            cursor.CreateOrUpdateKeyValue(key, value);
+        }
+
+        return allocatedId;
     }
 
     ReadOnlySpan<byte> ValueBytes(T obj, scoped ref MemWriter writer)
@@ -106,6 +138,11 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
         }
 
         return true;
+    }
+
+    public void InsertUniqueOrThrow(T obj)
+    {
+        if (!Insert(obj)) throw new BTDBException("Trying to insert duplicate key in " + _relationInfo.Name);
     }
 
     [SkipLocalsInit]
@@ -541,7 +578,7 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
             }
 
             var obj = _relationInfo.ItemLoaderInfos[0].CreateInstance(_transaction, cursor, fullKeyBytes);
-            if (beforeRemove(_transaction, _transaction.Owner.ActualOptions.Container!, obj))
+            if (beforeRemove(_transaction, obj))
                 return false;
         }
         else
@@ -598,7 +635,7 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
             }
 
             var obj = _relationInfo.ItemLoaderInfos[0].CreateInstance(_transaction, cursor, keyBytes);
-            if (beforeRemove(_transaction, _transaction.Owner.ActualOptions.Container!, obj))
+            if (beforeRemove(_transaction, obj))
                 return false;
         }
 
@@ -647,7 +684,7 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
             }
 
             var obj = _relationInfo.ItemLoaderInfos[0].CreateInstance(_transaction, cursor, fullKeyBytes);
-            if (beforeRemove(_transaction, _transaction.Owner.ActualOptions.Container!, obj))
+            if (beforeRemove(_transaction, obj))
                 return false;
         }
         else
@@ -711,7 +748,7 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
             if (beforeRemove != null)
             {
                 var obj = enumerator.Current!;
-                if (beforeRemove(_transaction, _transaction.Owner.ActualOptions.Container!, obj))
+                if (beforeRemove(_transaction, obj))
                     continue;
             }
 
@@ -765,7 +802,7 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
             if (beforeRemove != null)
             {
                 var obj = enumerator.Current!;
-                if (beforeRemove(_transaction, _transaction.Owner.ActualOptions.Container!, obj))
+                if (beforeRemove(_transaction, obj))
                     continue;
             }
 
@@ -971,7 +1008,7 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
             if (beforeRemove != null)
             {
                 var obj = _relationInfo.ItemLoaderInfos[0].CreateInstance(_transaction, cursor, fullKeyBytes);
-                if (beforeRemove(_transaction, _transaction.Owner.ActualOptions.Container!, obj))
+                if (beforeRemove(_transaction, obj))
                     continue;
             }
 
@@ -1000,6 +1037,14 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
     {
         var loaderInfo = new RelationInfo.ItemLoaderInfo(_relationInfo, typeof(TAs));
         return new RelationEnumerator<TAs>(_transaction, _relationInfo.Prefix, loaderInfo);
+    }
+
+    public IQueryable<TAs> Query<TAs>() where TAs : class
+    {
+        if (ReflectionMetadata.FindByType(typeof(TAs)) == null)
+            throw new BTDBException($"Type {typeof(TAs).ToSimpleName()} does not have registered metadata.");
+        var loaderInfo = new RelationInfo.ItemLoaderInfo(_relationInfo, typeof(TAs));
+        return new RelationQuery<TAs>(_transaction, _relationInfo, loaderInfo);
     }
 
     public TItem FindByIdOrDefault<TItem>(in ReadOnlySpan<byte> keyBytes, bool throwWhenNotFound, int loaderIndex)
@@ -1033,7 +1078,7 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
         return new RelationPrimaryKeyEnumerator<TItem>(_transaction, _relationInfo, keyBytesPrefix, loaderIndex);
     }
 
-    public TItem FirstByPrimaryKey<TItem>(int loaderIndex, ConstraintInfo[] constraints, ICollection<TItem> target,
+    public TItem FirstByPrimaryKey<TItem>(int loaderIndex, ConstraintInfo[] constraints, ICollection<TItem>? target,
         IOrderer[]? orderers, bool hasOrDefault) where TItem : class
     {
         var keyBytes = MemWriter.CreateFromStackAllocatedSpan(stackalloc byte[4096]);
@@ -1136,6 +1181,66 @@ public class RelationDBManipulator<T> : IRelation<T>, IRelationDbManipulator whe
                 sns.Dispose();
             }
         }
+    }
+
+    public TItem LastByPrimaryKey<TItem>(int loaderIndex, ConstraintInfo[] constraints, ICollection<TItem>? target,
+        IOrderer[]? orderers, bool hasOrDefault) where TItem : class
+    {
+        if (orderers != null && orderers.Length > 0)
+        {
+            var invertedOrderers = new IOrderer[orderers.Length];
+            for (var i = 0; i < orderers.Length; i++) invertedOrderers[i] = Orderer.Backwards(orderers[i]);
+            return FirstByPrimaryKey<TItem>(loaderIndex, constraints, target, invertedOrderers, hasOrDefault);
+        }
+
+        var keyBytes = MemWriter.CreateFromStackAllocatedSpan(stackalloc byte[4096]);
+        keyBytes.WriteBlock(_relationInfo.Prefix);
+
+        Span<byte> buffer = stackalloc byte[4096];
+        var writer = MemWriter.CreateFromStackAllocatedSpan(buffer);
+
+        using var enumerator = new RelationConstraintReverseEnumerator<TItem>(_transaction, _relationInfo, keyBytes,
+            writer,
+            loaderIndex, constraints);
+
+        if (enumerator.MoveNext())
+        {
+            return enumerator.Current!;
+        }
+
+        ThrowIfNotHasOrDefault(hasOrDefault);
+        return null!;
+    }
+
+    [SkipLocalsInit]
+    public TItem LastBySecondaryKey<TItem>(int loaderIndex, ConstraintInfo[] constraints, uint secondaryKeyIndex,
+        IOrderer[]? orderers, bool hasOrDefault) where TItem : class
+    {
+        if (orderers != null && orderers.Length > 0)
+        {
+            var invertedOrderers = new IOrderer[orderers.Length];
+            for (var i = 0; i < orderers.Length; i++) invertedOrderers[i] = Orderer.Backwards(orderers[i]);
+            return FirstBySecondaryKey<TItem>(loaderIndex, constraints, secondaryKeyIndex, invertedOrderers,
+                hasOrDefault);
+        }
+
+        var keyBytes = MemWriter.CreateFromStackAllocatedSpan(stackalloc byte[4096]);
+        keyBytes.WriteBlock(_relationInfo.PrefixSecondary);
+        var remappedSecondaryKeyIndex = RemapPrimeSK(secondaryKeyIndex);
+        keyBytes.WriteUInt8((byte)remappedSecondaryKeyIndex);
+        var writer = MemWriter.CreateFromStackAllocatedSpan(stackalloc byte[4096]);
+
+        using var enumerator = new RelationConstraintSecondaryKeyReverseEnumerator<TItem>(_transaction, _relationInfo,
+            keyBytes, writer,
+            loaderIndex, constraints, remappedSecondaryKeyIndex, this);
+
+        if (enumerator.MoveNextInGather())
+        {
+            return enumerator.Current!;
+        }
+
+        ThrowIfNotHasOrDefault(hasOrDefault);
+        return null!;
     }
 
     static void ThrowIfNotHasOrDefault(bool hasOrDefault)

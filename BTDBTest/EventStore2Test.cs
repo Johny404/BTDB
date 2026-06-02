@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using BTDB.EventStore2Layer;
 using BTDB.EventStoreLayer;
 using Xunit;
@@ -8,7 +9,9 @@ using BTDB.FieldHandler;
 using BTDB.KVDBLayer;
 using BTDB.ODBLayer;
 using System.Linq;
+using BTDB;
 using BTDB.Encrypted;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
 
 namespace BTDBTest;
@@ -91,6 +94,7 @@ public class EventStore2Test
         Alive = 1
     }
 
+    [Generate]
     public class ObjectWithEnum : IEquatable<ObjectWithEnum>
     {
         public StateEnum State { get; set; }
@@ -125,6 +129,7 @@ public class EventStore2Test
         Assert.Equal(obj, obj2);
     }
 
+    [Generate]
     public class ObjectWithList : IEquatable<ObjectWithList>
     {
         public List<int> Items { get; set; }
@@ -158,11 +163,12 @@ public class EventStore2Test
         public override int GetHashCode() => Items?.GetHashCode() ?? 0;
     }
 
+    [Generate]
     public class ObjectWithIList : IEquatable<ObjectWithIList>
     {
-        public IList<int> Items { get; set; }
+        public IList<int>? Items { get; set; }
 
-        public bool Equals(ObjectWithIList other)
+        public bool Equals(ObjectWithIList? other)
         {
             if (other == null)
                 return false;
@@ -174,9 +180,9 @@ public class EventStore2Test
             if (Items != null && other.Items == null)
                 return false;
 
-            for (var i = 0; i < Items.Count; i++)
+            for (var i = 0; i < Items!.Count; i++)
             {
-                if (Items[i] != other.Items[i])
+                if (Items[i] != other.Items![i])
                     return false;
             }
 
@@ -191,11 +197,12 @@ public class EventStore2Test
         public override int GetHashCode() => Items?.GetHashCode() ?? 0;
     }
 
+    [Generate]
     public class ObjectWithIList2 : IEquatable<ObjectWithIList2>
     {
-        public IList<ObjectDbTest.Person> Items { get; set; }
+        public IList<ObjectDbTest.Person>? Items { get; set; }
 
-        public bool Equals(ObjectWithIList2 other)
+        public bool Equals(ObjectWithIList2? other)
         {
             if (other == null)
                 return false;
@@ -207,13 +214,7 @@ public class EventStore2Test
             if (Items != null && other.Items == null)
                 return false;
 
-            for (var i = 0; i < Items.Count; i++)
-            {
-                if (!Items[i].Equals(other.Items[i]))
-                    return false;
-            }
-
-            return true;
+            return Items!.SequenceEqual(other.Items!);
         }
 
         public override bool Equals(object obj)
@@ -228,7 +229,7 @@ public class EventStore2Test
     public void DeserializesClassWithList()
     {
         var serializer = new EventSerializer();
-        var obj = new ObjectWithList { Items = new List<int> { 1 } };
+        var obj = new ObjectWithList { Items = [1] };
         var meta = serializer.Serialize(out var hasMetadata, obj).ToAsyncSafe();
         serializer.ProcessMetadataLog(meta);
         var data = serializer.Serialize(out hasMetadata, obj);
@@ -244,7 +245,7 @@ public class EventStore2Test
     public void DeserializesAsObjectClassWithList()
     {
         var serializer = new EventSerializer();
-        var obj = new ObjectWithList { Items = new List<int> { 1 } };
+        var obj = new ObjectWithList { Items = [1] };
         var meta = serializer.Serialize(out var hasMetadata, obj).ToAsyncSafe();
         serializer.ProcessMetadataLog(meta);
         var data = serializer.Serialize(out hasMetadata, obj);
@@ -271,7 +272,7 @@ public class EventStore2Test
         Assert.True(deserializer.Deserialize(out obj2, data));
         Assert.Equal(obj, obj2);
 
-        deserializer = new EventDeserializer();
+        deserializer = new();
         deserializer.ProcessMetadataLog(meta);
         Assert.True(deserializer.Deserialize(out obj2, data));
         Assert.Equal(obj, obj2);
@@ -282,7 +283,7 @@ public class EventStore2Test
     {
         var serializer = new EventSerializer();
         var obj = new ObjectWithIList2
-            { Items = new List<ObjectDbTest.Person> { new ObjectDbTest.Person { Name = "A", Age = 1 } } };
+            { Items = new List<ObjectDbTest.Person> { new() { Name = "A", Age = 1 } } };
         var meta = serializer.Serialize(out var hasMetadata, obj).ToAsyncSafe();
         Assert.Equal(99, meta.Length);
         serializer.ProcessMetadataLog(meta);
@@ -294,7 +295,7 @@ public class EventStore2Test
         Assert.True(deserializer.Deserialize(out obj2, data));
         Assert.Equal(obj, obj2);
 
-        deserializer = new EventDeserializer();
+        deserializer = new();
         deserializer.ProcessMetadataLog(meta);
         Assert.True(deserializer.Deserialize(out obj2, data));
         Assert.Equal(obj, obj2);
@@ -305,13 +306,13 @@ public class EventStore2Test
     {
         var serializer = new EventSerializer();
         var obj = new ObjectWithIList2
-            { Items = new ObjectDbTest.Person[] { new ObjectDbTest.Person { Name = "A", Age = 1 } } };
+            { Items = [new() { Name = "A", Age = 1 }] };
         var meta = serializer.Serialize(out var hasMetadata, obj).ToAsyncSafe();
         Assert.Equal(99, meta.Length);
         serializer.ProcessMetadataLog(meta);
         var data = serializer.Serialize(out hasMetadata, obj);
 
-        serializer = new EventSerializer();
+        serializer = new();
         serializer.ProcessMetadataLog(meta);
         var data2 = serializer.Serialize(out hasMetadata, obj);
 
@@ -321,7 +322,7 @@ public class EventStore2Test
         Assert.True(deserializer.Deserialize(out obj2, data));
         Assert.Equal(obj, obj2);
 
-        deserializer = new EventDeserializer();
+        deserializer = new();
         deserializer.ProcessMetadataLog(meta);
         Assert.True(deserializer.Deserialize(out obj2, data));
         Assert.Equal(obj, obj2);
@@ -333,13 +334,14 @@ public class EventStore2Test
         var serializer = new EventSerializer();
         var objE = new ObjectWithIList2 { Items = null };
         var obj = new ObjectWithIList2
-            { Items = new ObjectDbTest.Person[] { new ObjectDbTest.Manager { Name = "A", Age = 1 } } };
+            { Items = [new ObjectDbTest.Manager { Name = "A", Age = 1 }] };
         var meta = serializer.Serialize(out var hasMetadata, objE).ToAsyncSafe();
         serializer.ProcessMetadataLog(meta);
         var data = serializer.Serialize(out hasMetadata, objE);
         var data2 = serializer.Serialize(out hasMetadata, obj);
     }
 
+    [Generate]
     public class ObjectWithDictionaryOfSimpleType : IEquatable<ObjectWithDictionaryOfSimpleType>
     {
         public IDictionary<int, string> Items { get; set; }
@@ -407,6 +409,7 @@ public class EventStore2Test
         Assert.Equal("Ahoj", obj2.Items[1].ToString());
     }
 
+    [Generate]
     public class EventWithIIndirect
     {
         public string Name { get; set; }
@@ -422,7 +425,7 @@ public class EventStore2Test
         {
             Name = "A",
             Ind1 = new DBIndirect<User>(),
-            Ind2 = new List<IIndirect<User>>()
+            Ind2 = []
         };
         var meta = serializer.Serialize(out var hasMetadata, obj).ToAsyncSafe();
         serializer.ProcessMetadataLog(meta);
@@ -453,6 +456,7 @@ public class EventStore2Test
         Assert.Equal("c", ev.C);
     }
 
+    [Generate]
     public class EventWithUser
     {
         public User User { get; set; }
@@ -464,7 +468,7 @@ public class EventStore2Test
         var serializer = new EventSerializer();
         var obj = new EventWithUser
         {
-            User = new User()
+            User = new()
         };
         var meta = serializer.Serialize(out var hasMetadata, obj).ToAsyncSafe();
         serializer.ProcessMetadataLog(meta);
@@ -476,6 +480,7 @@ public class EventStore2Test
         Assert.True(deserializer.Deserialize(out obj2, data));
     }
 
+    [Generate]
     public class DtoWithNotStored
     {
         public string Name { get; set; }
@@ -498,6 +503,7 @@ public class EventStore2Test
         Assert.Equal(0, ((DtoWithNotStored)obj2).Skip);
     }
 
+    [Generate]
     public class DtoWithObject
     {
         public object Something { get; set; }
@@ -519,6 +525,7 @@ public class EventStore2Test
         Assert.Equal(1.2, ((DtoWithObject)obj2).Something);
     }
 
+    [Generate]
     public class PureArray
     {
         public string[] A { get; set; }
@@ -529,7 +536,7 @@ public class EventStore2Test
     public void SupportPureArray()
     {
         var serializer = new EventSerializer();
-        var obj = new PureArray { A = new[] { "A", "B" }, B = new[] { 42, 7 } };
+        var obj = new PureArray { A = ["A", "B"], B = [42, 7] };
         var meta = serializer.Serialize(out var hasMetadata, obj).ToAsyncSafe();
         serializer.ProcessMetadataLog(meta);
         var data = serializer.Serialize(out hasMetadata, obj);
@@ -645,11 +652,13 @@ public class EventStore2Test
         Employed = 1
     }
 
+    [Generate]
     public class EventWithEnum
     {
         public WorkStatus Status { get; set; }
     }
 
+    [Generate]
     public class EventWithInt
     {
         public int Status { get; set; }
@@ -699,6 +708,7 @@ public class EventStore2Test
         Assert.Equal(readedEvem.Status, (int)original.Status);
     }
 
+    [Generate]
     public class EventWithString
     {
         public string Status { get; set; }
@@ -727,9 +737,13 @@ public class EventStore2Test
         object readed;
         //Assert.True(deserializer.Deserialize(out readed, data));
         var e = Assert.Throws<BTDBException>(() => deserializer.Deserialize(out readed, data));
-        Assert.Contains("Deserialization of type " + typeof(EventWithInt).FullName, e.Message);
+        if (e.Message.StartsWith("Deserialization"))
+            Assert.Contains("Deserialization of type " + typeof(EventWithInt).FullName, e.Message);
+        else
+            Assert.Contains("Cannot load String and convert string to int", e.Message);
     }
 
+    [Generate]
     public class EventWithNullable
     {
         public ulong EventId { get; set; }
@@ -748,8 +762,8 @@ public class EventStore2Test
         {
             EventId = 1,
             NullableInt = 42,
-            ListWithNullables = new List<int?> { 4, new int?() },
-            DictionaryWithNullables = new Dictionary<int?, bool?> { { 1, true }, { 2, new bool?() } }
+            ListWithNullables = [4, new int?()],
+            DictionaryWithNullables = new Dictionary<int?, bool?> { { 1, true }, { 2, null } }
         };
         var meta = serializer.Serialize(out _, obj).ToAsyncSafe();
         serializer.ProcessMetadataLog(meta);
@@ -810,6 +824,7 @@ public class EventStore2Test
         Assert.Equal(input2, obj2);
     }
 
+    [Generate]
     public class ObjectWithMultipleReferences
     {
         public object Reference1 { get; set; }
@@ -839,6 +854,7 @@ public class EventStore2Test
         }
     }
 
+    [Generate]
     public class ComplexObject
     {
         public ComplexObject Obj { get; set; }
@@ -849,6 +865,7 @@ public class EventStore2Test
         public int Int { get; set; }
     }
 
+    [Generate]
     public class EventWithDeepDictWithComplexObject
     {
         public ulong EventId { get; set; }
@@ -863,14 +880,14 @@ public class EventStore2Test
         var obj = new EventWithDeepDictWithComplexObject
         {
             EventId = 1,
-            Prop = new Dictionary<ulong, Dictionary<string, ComplexObject>>
+            Prop = new()
             {
                 {
                     1,
-                    new Dictionary<string, ComplexObject> { { "a", new ComplexObjectEx { Obj = new ComplexObject() } } }
+                    new() { { "a", new ComplexObjectEx { Obj = new() } } }
                 }
             },
-            PropList = new List<List<ComplexObject>> { new List<ComplexObject> { new ComplexObjectEx() } }
+            PropList = [new List<ComplexObject> { new ComplexObjectEx() }]
         };
         var meta = serializer.Serialize(out _, obj).ToAsyncSafe();
         serializer.ProcessMetadataLog(meta);
@@ -884,6 +901,7 @@ public class EventStore2Test
         Assert.Equal(1ul, ev.Prop.First().Key);
     }
 
+    [Generate]
     public class EventWithEncryptedString
     {
         public EncryptedString Secret { get; set; }
@@ -892,12 +910,11 @@ public class EventStore2Test
     [Fact]
     public void SerializeDeserializeEventWithEncryptedString()
     {
-        var cipher = new AesGcmSymmetricCipher(new byte[]
-        {
+        var cipher = new AesGcmSymmetricCipher([
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
             28, 29, 30, 31
-        });
-        var serializer = new EventSerializer(null, null, cipher);
+        ]);
+        var serializer = new EventSerializer(null, null, null, cipher);
         var obj = new EventWithEncryptedString
         {
             Secret = "pass"
@@ -906,7 +923,7 @@ public class EventStore2Test
         serializer.ProcessMetadataLog(meta);
         var data = serializer.Serialize(out _, obj);
 
-        var deserializer = new EventDeserializer(null, null, cipher);
+        var deserializer = new EventDeserializer(null, null, null, cipher);
         Assert.False(deserializer.Deserialize(out var obj2, data));
         deserializer.ProcessMetadataLog(meta);
         Assert.True(deserializer.Deserialize(out obj2, data));
@@ -914,20 +931,21 @@ public class EventStore2Test
         Assert.Equal("pass", ev.Secret);
     }
 
+    [Generate]
     public class ObjectWithIDictionary
     {
         public IDictionary<ulong, string> Items { get; set; }
     }
 
     [Fact]
-    public void CanSerializeOdbDictionary()
+    public async Task CanSerializeOdbDictionary()
     {
         using (var kvDb = new BTreeKeyValueDB(new InMemoryFileCollection()))
         using (var objDb = new ObjectDB())
         {
             objDb.Open(kvDb, false);
 
-            using (var tr = objDb.StartWritingTransaction().Result)
+            using (var tr = await objDb.StartWritingTransaction())
             {
                 var singleton = tr.Singleton<ObjectWithIDictionary>();
                 singleton.Items[1] = "ahoj";
@@ -958,6 +976,7 @@ public class EventStore2Test
         Assert.Equal(obj.Items, ((ObjectWithIDictionary)obj2).Items);
     }
 
+    [Generate]
     public class SomeSets
     {
         public ISet<string> A { get; set; }
@@ -968,7 +987,7 @@ public class EventStore2Test
     public void SupportSets()
     {
         var serializer = new EventSerializer();
-        var obj = new SomeSets { A = new HashSet<string> { "A", "B" }, B = new HashSet<int> { 42, 7 } };
+        var obj = new SomeSets { A = new HashSet<string> { "A", "B" }, B = [42, 7] };
         var meta = serializer.Serialize(out _, obj).ToAsyncSafe();
         serializer.ProcessMetadataLog(meta);
         var data = serializer.Serialize(out _, obj);
@@ -979,8 +998,33 @@ public class EventStore2Test
         Assert.True(deserializer.Deserialize(out obj2, data));
 
         var ev = obj2 as SomeSets;
-        Assert.Equal(new[] { "A", "B" }, ev!.A.OrderBy(a => a));
-        Assert.Equal(new[] { 7, 42 }, ev.B.OrderBy(b => b));
+        Assert.Equal(["A", "B"], ev!.A.OrderBy(a => a));
+        Assert.Equal([7, 42], ev.B.OrderBy(b => b));
+    }
+
+    [Fact]
+    public void SupportSetsAfterRemove()
+    {
+        var serializer = new EventSerializer();
+        var obj = new SomeSets
+        {
+            A = new HashSet<string> { "A", "B", "C" },
+            B = [42, 7, 100]
+        };
+        obj.A.Remove("B");
+        obj.B.Remove(7);
+        var meta = serializer.Serialize(out _, obj).ToAsyncSafe();
+        serializer.ProcessMetadataLog(meta);
+        var data = serializer.Serialize(out _, obj);
+
+        var deserializer = new EventDeserializer();
+        Assert.False(deserializer.Deserialize(out var obj2, data));
+        deserializer.ProcessMetadataLog(meta);
+        Assert.True(deserializer.Deserialize(out obj2, data));
+
+        var ev = obj2 as SomeSets;
+        Assert.Equal(["A", "C"], ev!.A.OrderBy(a => a));
+        Assert.Equal([42, 100], ev.B.OrderBy(b => b));
     }
 
     [Fact]
@@ -1018,9 +1062,9 @@ public class EventStore2Test
             }
         }
 
-        Store(new Dictionary<int, List<bool>> { { 1, new List<bool> { true } } });
+        Store(new Dictionary<int, List<bool>> { { 1, [true] } });
         Store(new Dictionary<int, IList<bool>> { { 1, new List<bool> { true } } });
-        Store(new Dictionary<int, IList<bool>> { { 1, new[] { true } } });
+        Store(new Dictionary<int, IList<bool>> { { 1, [true] } });
     }
 
     [Fact]
@@ -1046,6 +1090,17 @@ public class EventStore2Test
         Assert.Equivalent(obj, obj2);
     }
 
+    [Generate]
+    public class RegisterHelper
+    {
+        public IDictionary<ulong, ICollection<ulong>>? V1;
+        public Dictionary<ulong, ulong[]>? V2;
+        public Dictionary<ulong, IList<ulong>>? V3;
+        public List<bool>? V4;
+        public Dictionary<int, List<bool>>? V5;
+        public Dictionary<int, IList<bool>>? V6;
+    }
+
     [Fact]
     public void DictionaryWithSomeNullArrayAsValue()
     {
@@ -1053,9 +1108,9 @@ public class EventStore2Test
         var obj = new Dictionary<ulong, ulong[]>
         {
             { 1, null },
-            { 2, new ulong[] { 21, 22 } },
+            { 2, [21, 22] },
             { 3, null },
-            { 4, new ulong[] { 41, 42 } }
+            { 4, [41, 42] }
         };
         var meta = serializer.Serialize(out _, obj).ToAsyncSafe();
         serializer.ProcessMetadataLog(meta);
@@ -1072,7 +1127,7 @@ public class EventStore2Test
     [Fact(Skip = "Generic serialization of structs is hard to implement, that's why it is not working for now.")]
     public void SerializationOfStruct_Succeeds()
     {
-        var testStruct = new TestStruct { TestData = new TestStruct.TestStructData { Data = "TestData" } };
+        var testStruct = new TestStruct { TestData = new() { Data = "TestData" } };
 
         var result = SerializationInternal<TestStruct>(testStruct);
 
@@ -1090,6 +1145,8 @@ public class EventStore2Test
         Assert.Equal(testBaseClass.TestData, result.TestData);
     }
 
+    [GenerateFor(typeof(GenClass<int>))]
+    [GenerateFor(typeof(GenClass<(int, string)>))]
     public class GenClass<T>
     {
         public T Member { get; set; }
@@ -1098,9 +1155,24 @@ public class EventStore2Test
     [Fact]
     public void GenericClassSerializationSucceeds()
     {
-        var test = new GenClass<int>();
-        test.Member = 42;
+        var test = new GenClass<int>
+        {
+            Member = 42
+        };
         var result = SerializationInternal<GenClass<int>>(test);
+
+        Assert.NotNull(result);
+        Assert.Equal(test.Member, result.Member);
+    }
+
+    [Fact]
+    public void TupleSerializationSucceeds()
+    {
+        var test = new GenClass<(int, string)>
+        {
+            Member = (42, "42")
+        };
+        var result = SerializationInternal<GenClass<(int, string)>>(test);
 
         Assert.NotNull(result);
         Assert.Equal(test.Member, result.Member);
@@ -1112,17 +1184,17 @@ public class EventStore2Test
         var serializer = new EventSerializer();
         var obj = new ObjectWithGenericType
         {
-            TypeA = new GenericType<SomeTypeA>
+            TypeA = new()
             {
-                Type = new SomeTypeA
+                Type = new()
                 {
                     A = "A",
                     Name = "Name A"
                 }
             },
-            TypeB = new GenericType<SomeTypeB>
+            TypeB = new()
             {
-                Type = new SomeTypeB
+                Type = new()
                 {
                     B = "B",
                     Name = "Name B"
@@ -1139,12 +1211,13 @@ public class EventStore2Test
         Assert.True(deserializer.Deserialize(out obj2, data));
         Assert.Equal(obj, obj2);
 
-        deserializer = new EventDeserializer();
+        deserializer = new();
         deserializer.ProcessMetadataLog(meta);
         Assert.True(deserializer.Deserialize(out obj2, data));
         Assert.Equal(obj, obj2);
     }
 
+    [Generate]
     public class ObjectWithGenericType : IEquatable<ObjectWithGenericType>
     {
         public GenericType<SomeTypeA> TypeA { get; set; }
@@ -1277,12 +1350,15 @@ public class EventStore2Test
         }
     }
 
-    class TestClassWithBaseClass : TestBaseClass
+    [Generate]
+    [PersistedName("TestClassWithBaseClass")]
+    public class TestClassWithBaseClass : TestBaseClass
     {
         [NotStored] public string TestData => Data;
     }
 
-    class TestBaseClass
+    [Generate]
+    public class TestBaseClass
     {
         public string Data { get; private set; }
 
@@ -1292,6 +1368,7 @@ public class EventStore2Test
         }
     }
 
+    [Generate]
     public class Obj
     {
         public int Num { get; set; }
@@ -1302,11 +1379,13 @@ public class EventStore2Test
         public int Child { get; set; }
     }
 
+    [Generate]
     public class EObj
     {
         public Obj O { get; set; }
     }
 
+    [Generate]
     public class EObjV2
     {
         [PrimaryKey(1)] public ulong Id { get; set; }
@@ -1328,8 +1407,13 @@ public class EventStore2Test
         serializer.ProcessMetadataLog(meta);
         var data = serializer.Serialize(out _, value);
 
+        var converterFactory = new DefaultTypeConverterFactory();
+        converterFactory.RegisterConverter((in Obj i, out ObjChild o) =>
+        {
+            o = MyObjToObjChildTypeConvertorGenerator.Convert2ObjChild(i);
+        });
         var deserializer = new EventDeserializer(new OverloadableTypeMapper(typeof(EObjV2), "EObj"),
-            new MyObjToObjChildTypeConvertorGenerator());
+            converterFactory, new MyObjToObjChildTypeConvertorGenerator());
         deserializer.ProcessMetadataLog(meta);
         deserializer.Deserialize(out var deserializedObj, data);
 
@@ -1338,6 +1422,7 @@ public class EventStore2Test
         Assert.Equal(42, valueV2.O.Child);
     }
 
+    [Generate]
     public interface IContent
     {
         public ulong ContentId { get; set; }
@@ -1369,6 +1454,7 @@ public class EventStore2Test
         }
     }
 
+    [Generate]
     public class ClassWithIEnumerable : IEquatable<ClassWithIEnumerable>
     {
         public IEnumerable<IContent> Items { get; set; }
@@ -1400,7 +1486,7 @@ public class EventStore2Test
         var serializer = new EventSerializer();
         var obj = new ClassWithIEnumerable
         {
-            Items = new[] { new Content { ContentId = 1, Name = "A" }, new Content { ContentId = 2, Name = "B" } }
+            Items = [new Content { ContentId = 1, Name = "A" }, new Content { ContentId = 2, Name = "B" }]
         };
         var meta = serializer.Serialize(out var hasMetadata, obj).ToAsyncSafe();
         serializer.ProcessMetadataLog(meta);
@@ -1412,7 +1498,7 @@ public class EventStore2Test
         Assert.True(deserializer.Deserialize(out obj2, data));
         Assert.Equal(obj, obj2);
 
-        deserializer = new EventDeserializer();
+        deserializer = new();
         deserializer.ProcessMetadataLog(meta);
         Assert.True(deserializer.Deserialize(out obj2, data));
         Assert.Equal(obj, obj2);
@@ -1435,6 +1521,8 @@ public class EventStore2Test
     {
     }
 
+    [GenerateFor(typeof(DynamicValueWrapper<Enum>))]
+    [GenerateFor(typeof(DynamicValueWrapper<Money>))]
     public class DynamicValueWrapper<TValueType> : IDynamicValue
     {
         public TValueType Value { get; set; }
@@ -1454,6 +1542,7 @@ public class EventStore2Test
         public string Code { get; init; }
     }
 
+    [Generate]
     public class Root
     {
         public List<IDynamicValue> R { get; set; }
@@ -1471,26 +1560,27 @@ public class EventStore2Test
         var usd = new Currency() { Code = "USD", MinorToAmountRatio = 100 };
         var obj = new Root()
         {
-            R = new List<IDynamicValue>()
-            {
+            R =
+            [
                 new DynamicValueWrapper<Enum>() { Value = Test1.A },
                 new DynamicValueWrapper<Money>()
                 {
-                    Value = new Money()
+                    Value = new()
                     {
                         MinorValue = 10000,
                         Currency = usd
                     }
                 },
+
                 new DynamicValueWrapper<Money>()
                 {
-                    Value = new Money()
+                    Value = new()
                     {
                         MinorValue = 61000,
                         Currency = usd
                     }
                 }
-            }
+            ]
         };
         var obj2 = SerializationInternal<Root>(obj);
         Assert.Equal(obj.R.Count, obj2.R.Count);

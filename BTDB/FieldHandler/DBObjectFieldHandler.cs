@@ -1,13 +1,12 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
-using System.Threading;
-using BTDB.Collections;
+using System.Runtime.CompilerServices;
 using BTDB.IL;
 using BTDB.KVDBLayer;
 using BTDB.ODBLayer;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
 
 namespace BTDB.FieldHandler;
@@ -28,7 +27,7 @@ public class DBObjectFieldHandler : IFieldHandler, IFieldHandlerWithInit, IField
         if (_type.IsInterface || _type.IsAbstract)
         {
             _typeName = null;
-            _configuration = Array.Empty<byte>();
+            _configuration = [];
         }
         else
         {
@@ -170,6 +169,82 @@ public class DBObjectFieldHandler : IFieldHandler, IFieldHandlerWithInit, IField
             .Callvirt(typeof(IWriterCtx).GetMethod(nameof(IWriterCtx.WriteNativeObject))!);
     }
 
+    public FieldHandlerLoad Load(Type asType, ITypeConverterFactory typeConverterFactory)
+    {
+        var needType = Unwrap(asType);
+        if (needType != asType)
+        {
+            var indirectType = typeof(DBIndirect<>).MakeGenericType(_type!);
+            return (ref MemReader reader, IReaderCtx? ctx, ref byte value) =>
+            {
+                var oid = reader.ReadVInt64();
+                var res = new DBIndirect<object>(((IDBReaderCtx)ctx!).GetTransaction(), (ulong)oid);
+                RawData.SetMethodTable(res, indirectType);
+                Unsafe.As<byte, object>(ref value) = res;
+            };
+        }
+
+        if (asType == typeof(object))
+        {
+            return static (ref MemReader reader, IReaderCtx? ctx, ref byte value) =>
+            {
+                Unsafe.As<byte, object>(ref value) = ctx!.ReadNativeObject(ref reader);
+            };
+        }
+
+        if (_type != null && !asType.IsAssignableFrom(_type))
+        {
+            return this.BuildConvertingLoader(_type, asType, typeConverterFactory);
+        }
+
+        return this.BuildConvertingLoader(typeof(object), asType, typeConverterFactory);
+    }
+
+    public void Skip(ref MemReader reader, IReaderCtx? ctx)
+    {
+        ctx!.SkipNativeObject(ref reader);
+    }
+
+    public FieldHandlerSave Save(Type asType, ITypeConverterFactory typeConverterFactory)
+    {
+        var needType = Unwrap(asType);
+        if (needType != asType)
+        {
+            return (ref MemWriter writer, IWriterCtx? ctx, ref byte value) =>
+            {
+                var obj = Unsafe.As<byte, object>(ref value);
+                if (obj is IDBIndirect { Transaction: not null } ind)
+                {
+                    if (((IDBWriterCtx)ctx!).GetTransaction() != ind.Transaction)
+                    {
+                        throw new BTDBException("Transaction does not match when saving non-materialized IIndirect");
+                    }
+
+                    writer.WriteVInt64((long)ind.Oid);
+                    return;
+                }
+
+                if (obj is IIndirect ind2)
+                {
+                    ctx!.WriteNativeObjectPreventInline(ref writer, ind2.ValueAsObject);
+                    return;
+                }
+
+                ctx!.WriteNativeObjectPreventInline(ref writer, obj);
+            };
+        }
+
+        if (asType == typeof(object) || !asType.IsValueType)
+        {
+            return static (ref MemWriter writer, IWriterCtx? ctx, ref byte value) =>
+            {
+                ctx!.WriteNativeObject(ref writer, Unsafe.As<byte, object>(ref value));
+            };
+        }
+
+        return this.BuildConvertingSaver(asType, typeof(object), typeConverterFactory);
+    }
+
     public IFieldHandler SpecializeLoadForType(Type type, IFieldHandler? typeHandler, IFieldHandlerLogger? logger)
     {
         var needType = Unwrap(type);
@@ -202,49 +277,58 @@ public class DBObjectFieldHandler : IFieldHandler, IFieldHandlerWithInit, IField
         ilGenerator.Newobj(typeof(DBIndirect<>).MakeGenericType(_type!).GetDefaultConstructor()!);
     }
 
-    public NeedsFreeContent FreeContent(IILGen ilGenerator, Action<IILGen> pushReader, Action<IILGen> pushCtx)
+    public FieldHandlerInit Init()
     {
-        var needsFreeContent = NeedsFreeContent.No;
+        var indirectType = typeof(DBIndirect<>).MakeGenericType(_type!);
+        return (IReaderCtx? _, ref byte value) =>
+        {
+            var res = new DBIndirect<object>();
+            RawData.SetMethodTable(res, indirectType);
+            Unsafe.As<byte, object>(ref value) = res;
+        };
+    }
+
+    public void FreeContent(ref MemReader reader, IReaderCtx? ctx)
+    {
+        ctx!.FreeContentInNativeObject(ref reader);
+    }
+
+    public bool DoesNeedFreeContent(HashSet<Type> visitedTypes)
+    {
         var type = HandledType();
         if (type == typeof(object))
         {
-            needsFreeContent = NeedsFreeContent.Yes;
+            return true;
         }
         else
         {
             foreach (var st in _objectDb.GetPolymorphicTypes(type))
             {
-                UpdateNeedsFreeContent(st, ref needsFreeContent);
-                if (needsFreeContent == NeedsFreeContent.Yes) break;
+                if (UpdateNeedsFreeContent(st, visitedTypes)) return true;
             }
 
             if (!type.IsInterface && !type.IsAbstract)
-                UpdateNeedsFreeContent(type, ref needsFreeContent);
+                if (UpdateNeedsFreeContent(type, visitedTypes))
+                    return true;
         }
-        ilGenerator
-            .Do(pushCtx)
-            .Do(pushReader)
-            .Callvirt(typeof(IReaderCtx).GetMethod(nameof(IReaderCtx.FreeContentInNativeObject))!);
-        return needsFreeContent;
+
+        return false;
     }
 
-    static ThreadLocal<HashSet<Type>> StackOverflowProtection { get; } = new(() => new());
 
-    void UpdateNeedsFreeContent(Type type, ref NeedsFreeContent needsFreeContent)
+    bool UpdateNeedsFreeContent(Type type, HashSet<Type> visitedTypes)
     {
-        if (type.IsValueType) return;
+        if (type.IsValueType) return false;
         //decides upon current version  (null for object types never stored in DB)
         var tableInfo = ((ObjectDB)_objectDb).TablesInfo.FindByType(type);
         if (tableInfo == null)
         {
-            if (StackOverflowProtection.Value!.Contains(type)) return;
-            StackOverflowProtection.Value.Add(type);
+            if (!visitedTypes.Add(type)) return false;
             try
             {
-                if (type.GetCustomAttribute(typeof(RequireContentFreeAttribute)) != null)
+                if (type.GetCustomAttribute<RequireContentFreeAttribute>() != null)
                 {
-                    Extensions.UpdateNeedsFreeContent(NeedsFreeContent.Yes, ref needsFreeContent);
-                    return;
+                    return true;
                 }
 
                 var publicFields = type.GetFields(BindingFlags.Public | BindingFlags.Instance);
@@ -256,37 +340,34 @@ public class DBObjectFieldHandler : IFieldHandler, IFieldHandlerWithInit, IField
                 }
 
                 var props = type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                var fields = new StructList<TableFieldInfo>();
-                fields.Reserve((uint)props.Length);
-                var method = ILBuilder.Instance.NewMethod<ObjectFreeContent>($"Dummy");
-                var ilGenerator = method.Generator;
                 foreach (var pi in props)
                 {
                     if (pi.GetCustomAttribute<NotStoredAttribute>(true) != null) continue;
                     if (pi.GetIndexParameters().Length != 0) continue;
                     var fieldInfo = TableFieldInfo.Build(Name, pi, _objectDb.FieldHandlerFactory,
                         FieldHandlerOptions.None, pi.GetCustomAttribute<PrimaryKeyAttribute>()?.InKeyValue ?? false);
-                    Extensions.UpdateNeedsFreeContent(
-                        fieldInfo.Handler!.FreeContent(ilGenerator, _ => { }, _ => { }),
-                        ref needsFreeContent);
+                    if (fieldInfo.Handler!.DoesNeedFreeContent(visitedTypes)) return true;
                 }
             }
             finally
             {
-                StackOverflowProtection.Value.Remove(type);
+                visitedTypes.Remove(type);
             }
 
-            return;
+            return false;
         }
 
-        var needsContentPartial =
-            tableInfo?.IsFreeContentNeeded(tableInfo.ClientTypeVersion) ?? NeedsFreeContent.Unknown;
-        Extensions.UpdateNeedsFreeContent(needsContentPartial, ref needsFreeContent);
+        return tableInfo.IsFreeContentNeeded(tableInfo.ClientTypeVersion);
     }
 
     public void Register(object owner)
     {
         if (_type != null)
             (owner as ObjectDB)?.RegisterType(_type, false);
+    }
+
+    public override string ToString()
+    {
+        return $"DBObjectFieldHandler<{_typeName ?? "null"},{_type?.ToSimpleName() ?? "null"}>";
     }
 }

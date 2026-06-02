@@ -13,17 +13,17 @@ public class ApiKey
     [PrimaryKey(2)] public ulong ApiKeyId { get; set; }
 
     [SecondaryKey("Key", IncludePrimaryKeyOrder = 1)]
-    public string Key { get; set; }
+    public string Key { get; set; } = null!;
 
-    public string Name { get; set; }
-    public string Description { get; set; }
+    public string Name { get; set; } = null!;
+    public string Description { get; set; } = null!;
     public DateTime CreatedDate { get; set; }
     [InKeyValue(3)] public DateTime? LastUsedDate { get; set; }
     [InKeyValue(4)] public DateTime? ExpirationDate { get; set; }
     public ulong AdminRoleId { get; set; }
     public ISet<ulong> AdminRoleIds { get; set; } = new HashSet<ulong>();
     public ulong OwnerUserId { get; set; }
-    public ApiKeyIpFiltering IpFiltering { get; set; }
+    public ApiKeyIpFiltering IpFiltering { get; set; } = null!;
 
     public bool IsUserSpecific()
     {
@@ -72,21 +72,21 @@ public class ApiKeyInKeyValues
 public class ApiKeyIpFiltering
 {
     public bool IsIpFilterActive { get; set; }
-    public IList<ApiKeyIpFilter> IpAddresses { get; set; }
-    public IList<ApiKeyIpFilterRange> IpAddressRanges { get; set; }
+    public IList<ApiKeyIpFilter> IpAddresses { get; set; } = null!;
+    public IList<ApiKeyIpFilterRange> IpAddressRanges { get; set; } = null!;
 }
 
 public class ApiKeyIpFilter
 {
-    public string Name { get; set; }
-    public string IpAddress { get; set; }
+    public string Name { get; set; } = null!;
+    public string IpAddress { get; set; } = null!;
 }
 
 public class ApiKeyIpFilterRange
 {
-    public string Name { get; set; }
-    public string IpAddressFrom { get; set; }
-    public string IpAddressTo { get; set; }
+    public string Name { get; set; } = null!;
+    public string IpAddressFrom { get; set; } = null!;
+    public string IpAddressTo { get; set; } = null!;
 }
 
 public class InKeyValueStressTest

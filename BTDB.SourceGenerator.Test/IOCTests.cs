@@ -16,6 +16,7 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator("""
+            using System;
             namespace TestNamespace;
 
             [BTDB.Generate]
@@ -53,6 +54,7 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator("""
+            using System;
             namespace TestNamespace;
 
             [BTDB.Generate]
@@ -108,6 +110,7 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator("""
+            using System;
             namespace TestNamespace;
 
             [BTDB.Generate]
@@ -133,9 +136,9 @@ public class IOCTests : GeneratorTestsBase
                 IBetterLogger Logger { get; }
             }
 
-            public class Logger: AbstractLogger, IErrorHandler
+            public class ErrorHandler : AbstractLogger, IErrorHandler
             {
-                public Logger(int a, int b): base(a)
+                public ErrorHandler(int a, int b): base(a)
                 {
                 }
 
@@ -154,6 +157,10 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator("""
+            public interface IErrorHandler
+            {
+            }
+
             [BTDB.Generate]
             public class ErrorHandler : IErrorHandler
             {
@@ -171,6 +178,10 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator("""
+            public interface IErrorHandler
+            {
+            }
+
             [BTDB.Generate]
             public class ErrorHandler<T> : IErrorHandler
             {
@@ -263,11 +274,70 @@ public class IOCTests : GeneratorTestsBase
     }
 
     [Fact]
+    public Task VerifyIocRegistrationForDependencyFields()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            public interface ILogger
+            {
+            }
+
+            [BTDB.Generate]
+            public class ErrorHandler
+            {
+                [BTDB.IOC.Dependency]
+                public ILogger Logger;
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyIocRegistrationForNamedDependencyProperties()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            public interface ILogger
+            {
+            }
+
+            [BTDB.Generate]
+            public class ErrorHandler
+            {
+                [BTDB.IOC.Dependency("Key1")]
+                public ILogger Logger { get; set; }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyIocRegistrationForNamedDependencyFields()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            public interface ILogger
+            {
+            }
+
+            [BTDB.Generate]
+            public class ErrorHandler
+            {
+                [BTDB.IOC.Dependency("Key1")]
+                public ILogger Logger;
+            }
+            """);
+    }
+
+    [Fact]
     public Task VerifyDelegateGeneration()
     {
         // language=cs
         return VerifySourceGenerator(@"
+            using System;
             namespace TestNamespace;
+
+            public interface ILogger
+            {
+            }
 
             [BTDB.Generate]
             public delegate ILogger Factory(int a, string b);
@@ -279,6 +349,7 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator(@"
+            using System;
             namespace TestNamespace;
 
             public interface ILogger
@@ -299,6 +370,7 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator(@"
+            using System;
             namespace TestNamespace;
 
             public interface ILogger
@@ -319,6 +391,7 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator(@"
+            using System;
             namespace TestNamespace;
 
             [BTDB.Generate]
@@ -334,6 +407,7 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator(@"
+            using System;
             namespace TestNamespace;
 
             public class BaseClass
@@ -353,6 +427,7 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator(@"
+            using System;
             namespace TestNamespace;
 
             public interface ILogger
@@ -376,6 +451,7 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator(@"
+            using System;
             namespace TestNamespace;
 
             public interface ILogger
@@ -414,6 +490,7 @@ public class IOCTests : GeneratorTestsBase
     {
         // language=cs
         return VerifySourceGenerator(@"
+            using System;
             using BTDB.IOC;
             namespace TestNamespace;
 
@@ -430,6 +507,42 @@ public class IOCTests : GeneratorTestsBase
 
             public class MessageHandler : IDispatcher
             {
+                public void Consume(Message message)
+                {
+                    Console.WriteLine(message.Text);
+                }
+            }
+            ");
+    }
+
+    [Fact]
+    public Task VerifyTwoDispatchersGeneration()
+    {
+        // language=cs
+        return VerifySourceGenerator(@"
+            using System;
+            using BTDB.IOC;
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public partial interface IDispatcher
+            {
+                public static unsafe partial delegate*<IContainer, object, object?> CreateVerifyDispatcher(IContainer container);
+                public static unsafe partial delegate*<IContainer, object, object?> CreateConsumeDispatcher(IContainer container);
+            }
+
+            public class Message
+            {
+                public string Text { get; set; }
+            }
+
+            public class MessageHandler : IDispatcher
+            {
+                public object? Verify(Message message)
+                {
+                    return null;
+                }
+
                 public void Consume(Message message)
                 {
                     Console.WriteLine(message.Text);
@@ -597,5 +710,136 @@ public class IOCTests : GeneratorTestsBase
                 }
             }
             ");
+    }
+
+    [Fact]
+    public Task VerifySupportFromKeyedServices()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+            using Microsoft.Extensions.DependencyInjection;
+
+            public interface ILogger
+            {
+            }
+
+            public interface IErrorHandler
+            {
+                ILogger Logger { get; }
+            }
+
+            [BTDB.Generate]
+            public class ErrorHandler : IErrorHandler
+            {
+                readonly ILogger _logger;
+
+                public ErrorHandler([FromKeyedServices("key1")] ILogger logger)
+                {
+                    _logger = logger;
+                }
+
+                public ILogger Logger => _logger;
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifySupportFromKeyedServicesFromExternalDependency()
+    {
+        // language=cs
+        return VerifySourceGenerator(
+            "[assembly: BTDB.GenerateFor(typeof(Sample3rdPartyLib.Class3rdPartyWithKeyedDependency))]");
+    }
+
+    [Fact]
+    public Task VerifySupportNamedDependecyInParameters()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+            using BTDB.IOC;
+
+            public interface ILogger
+            {
+            }
+
+            public interface IErrorHandler
+            {
+                ILogger Logger { get; }
+            }
+
+            [BTDB.Generate]
+            public class ErrorHandler : IErrorHandler
+            {
+                readonly ILogger _logger;
+
+                public ErrorHandler([Dependency("key1")] ILogger logger)
+                {
+                    _logger = logger;
+                }
+
+                public ILogger Logger => _logger;
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyConstructorWithSelfDependency()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            [BTDB.Generate]
+            public class SelfDependency
+            {
+                public SelfDependency(SelfDependency self)
+                {
+                }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyConcreteClassInheritingGenericBaseWithConstraints()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            namespace TestNamespace;
+
+            public interface IInput
+            {
+            }
+
+            public interface IResult
+            {
+            }
+
+            [BTDB.Generate]
+            public interface IHandler<TInput, TResult>
+                where TInput : IInput where TResult : IResult
+            {
+                bool CanStart { get; set; }
+            }
+
+            public abstract class AbstractHandler<TInput, TResult> : IHandler<TInput, TResult>
+                where TInput : IInput where TResult : IResult
+            {
+                public bool CanStart { get; set; } = true;
+            }
+
+            public class ConcreteInput : IInput
+            {
+            }
+
+            public class ConcreteResult : IResult
+            {
+            }
+
+            public class ConcreteHandler : AbstractHandler<ConcreteInput, ConcreteResult>
+            {
+            }
+            """);
     }
 }

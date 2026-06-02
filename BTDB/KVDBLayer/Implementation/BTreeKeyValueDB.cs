@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -61,7 +60,6 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
 
     readonly IFileCollectionWithFileInfos _fileCollection;
     readonly Dictionary<long, object> _subDBs = new();
-    readonly Func<CancellationToken, bool>? _compactFunc;
     readonly bool _readOnly;
     readonly bool _lenientOpen;
     bool _disposed = false;
@@ -118,8 +116,8 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
         if (!_readOnly)
         {
             AdjustFileSize();
-            _compactFunc = _compactorScheduler?.AddCompactAction(Compact);
-            _compactorScheduler?.AdviceRunning(true);
+            _compactorScheduler?.AddCompactAction(this);
+            _compactorScheduler?.AdviceRunning(this, true);
         }
     }
 
@@ -315,16 +313,17 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
                 if (openUpToCommitUlong.HasValue || latestTrLogFileId != firstTrLogId && firstTrLogId != 0 ||
                     !hasKeyIndex && _fileCollection.FileInfos.Any(p => p.Value.SubDBId == 0))
                 {
-                    // Need to create new trl if cannot append to last one so it is then written to kvi
+                    // Need to create new trl if it cannot append to last one so it is then written to kvi
                     if (openUpToCommitUlong.HasValue && _fileIdWithTransactionLog == 0)
                     {
                         WriteStartOfNewTransactionLogFile();
                         _fileWithTransactionLog!.HardFlush();
-                        _fileWithTransactionLog.Truncate();
+                        // reinitialize MemWriter because it could be garbage after HardFlush();
+                        _writerWithTransactionLog = new(_fileWithTransactionLog.GetAppenderWriter());
                         UpdateTransactionLogInBTreeRoot(_lastCommitted);
                     }
 
-                    // When not opening history commit KVI file will be created by compaction
+                    // When not opening history commit, compaction will create KVI file
                     if (openUpToCommitUlong.HasValue)
                     {
                         CreateIndexFile(CancellationToken.None, preserveKeyIndexGeneration, true);
@@ -333,13 +332,10 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
 
                 if (_fileIdWithTransactionLog != 0)
                 {
-                    if (_writerWithTransactionLog.Controller == null)
-                    {
-                        _fileWithTransactionLog = FileCollection.GetFile(_fileIdWithTransactionLog);
-                        _writerWithTransactionLog = new(_fileWithTransactionLog!.GetAppenderWriter());
-                    }
+                    _fileWithTransactionLog = FileCollection.GetFile(_fileIdWithTransactionLog);
+                    _writerWithTransactionLog = new(_fileWithTransactionLog!.GetAppenderWriter());
 
-                    if (_writerWithTransactionLog.GetCurrentPosition() > MaxTrLogFileSize)
+                    if (_writerWithTransactionLog.GetCurrentPosition() >= MaxTrLogFileSize)
                     {
                         WriteStartOfNewTransactionLogFile();
                     }
@@ -367,14 +363,21 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
         }
     }
 
-    void MarkFileForRemoval(uint fileId)
+    bool MarkFileForRemoval(uint fileId)
     {
         var file = _fileCollection.GetFile(fileId);
+        var wasTrl = false;
         if (file != null)
+        {
+            wasTrl = _fileCollection.FileInfoByIdx(fileId)?.FileType == KVFileType.TransactionLog;
             Logger?.FileMarkedForDelete(file.Index);
+        }
+
         else
             Logger?.LogWarning($"Marking for delete file id {fileId} unknown in file collection.");
+
         _fileCollection.MakeIdxUnknown(fileId);
+        return wasTrl;
     }
 
     bool IKeyValueDBInternal.LoadUsedFilesFromKeyIndex(uint fileId, IKeyIndex info)
@@ -413,10 +416,10 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
         return preserveKeyIndexKey;
     }
 
-    long IKeyValueDBInternal.ReplaceBTreeValues(CancellationToken cancellation,
+    async ValueTask<long> IKeyValueDBInternal.ReplaceBTreeValues(CancellationToken cancellation,
         RefDictionary<ulong, uint> newPositionMap, uint targetFileId)
     {
-        return ReplaceBTreeValues(cancellation, newPositionMap, targetFileId);
+        return await ReplaceBTreeValues(cancellation, newPositionMap, targetFileId);
     }
 
     long[] IKeyValueDBInternal.CreateIndexFile(CancellationToken cancellation, long preserveKeyIndexGeneration)
@@ -977,7 +980,7 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
 
     public void Dispose()
     {
-        _compactorScheduler?.RemoveCompactAction(_compactFunc!);
+        _compactorScheduler?.RemoveCompactAction(this);
         lock (_writeLock)
         {
             if (_writingTransaction != null)
@@ -1021,9 +1024,9 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
         }
     }
 
-    void IKeyValueDBInternal.MarkAsUnknown(IEnumerable<uint> fileIds)
+    bool IKeyValueDBInternal.MarkAsUnknown(IEnumerable<uint> fileIds)
     {
-        MarkAsUnknown(fileIds);
+        return MarkAsUnknown(fileIds);
     }
 
     IFileCollectionWithFileInfos IKeyValueDBInternal.FileCollection => FileCollection;
@@ -1118,7 +1121,8 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
                 return new(tr);
             }
 
-            var tcs = new TaskCompletionSource<IKeyValueDBTransaction>();
+            var tcs = new TaskCompletionSource<IKeyValueDBTransaction>(TaskCreationOptions
+                .RunContinuationsAsynchronously);
             _writeWaitingQueue.Enqueue(tcs);
             return new(tcs.Task);
         }
@@ -1179,9 +1183,9 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
         return _allocator.GetStats();
     }
 
-    public bool Compact(CancellationToken cancellation)
+    public async ValueTask<bool> Compact(CancellationToken cancellation)
     {
-        return new Compactor(this, cancellation).Run();
+        return await new Compactor(this, cancellation).Run();
     }
 
     public void CreateKvi(CancellationToken cancellation)
@@ -1256,6 +1260,8 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
             if (DurableTransactions)
             {
                 _fileWithTransactionLog!.HardFlush();
+                // Reinitialize MemWriter because its content could be invalid due to HardFlush
+                _writerWithTransactionLog = new(_fileWithTransactionLog.GetAppenderWriter());
             }
 
             UpdateTransactionLogInBTreeRoot(root);
@@ -1263,7 +1269,9 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
             {
                 _writerWithTransactionLog.WriteUInt8((byte)KVCommandType.TemporaryEndOfFile);
                 _writerWithTransactionLog.Flush();
-                _fileWithTransactionLog!.Truncate();
+                _fileWithTransactionLog!.HardFlush();
+                // Reinitialize MemWriter because its content could be invalid due to HardFlush
+                _writerWithTransactionLog = new(_fileWithTransactionLog.GetAppenderWriter());
             }
 
             lock (_writeLock)
@@ -1308,7 +1316,7 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
     {
         if (root.TrLogFileId != _fileIdWithTransactionLog && root.TrLogFileId != 0)
         {
-            _compactorScheduler?.AdviceRunning(false);
+            _compactorScheduler?.AdviceRunning(this, false);
         }
 
         root.TrLogFileId = _fileIdWithTransactionLog;
@@ -1431,7 +1439,7 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
                 _writerWithTransactionLog = new(_fileWithTransactionLog!.GetAppenderWriter());
             }
 
-            if (_writerWithTransactionLog.GetCurrentPosition() > MaxTrLogFileSize)
+            if (_writerWithTransactionLog.GetCurrentPosition() >= MaxTrLogFileSize)
             {
                 WriteStartOfNewTransactionLogFile();
             }
@@ -1583,7 +1591,7 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
 
     public void WriteEraseOneCommand(in ReadOnlySpan<byte> keyPrefix, in ReadOnlySpan<byte> keySuffix)
     {
-        if (_writerWithTransactionLog.GetCurrentPosition() > MaxTrLogFileSize)
+        if (_writerWithTransactionLog.GetCurrentPosition() >= MaxTrLogFileSize)
         {
             WriteStartOfNewTransactionLogFile();
         }
@@ -1597,7 +1605,7 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
     public void WriteEraseRangeCommand(in ReadOnlySpan<byte> firstKeyPrefix, in ReadOnlySpan<byte> firstKeySuffix,
         in ReadOnlySpan<byte> secondKeyPrefix, in ReadOnlySpan<byte> secondKeySuffix)
     {
-        if (_writerWithTransactionLog.GetCurrentPosition() > MaxTrLogFileSize)
+        if (_writerWithTransactionLog.GetCurrentPosition() >= MaxTrLogFileSize)
         {
             WriteStartOfNewTransactionLogFile();
         }
@@ -1759,14 +1767,14 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
         return writer;
     }
 
-    long ReplaceBTreeValues(CancellationToken cancellation, RefDictionary<ulong, uint> newPositionMap,
+    async ValueTask<long> ReplaceBTreeValues(CancellationToken cancellation, RefDictionary<ulong, uint> newPositionMap,
         uint targetFileId)
     {
         byte[] restartKey = null;
         while (true)
         {
             var iterationTimeOut = DateTime.UtcNow + TimeSpan.FromMilliseconds(50);
-            using (var tr = StartWritingTransaction().GetAwaiter().GetResult())
+            using (var tr = await StartWritingTransaction().ConfigureAwait(false))
             {
                 var newRoot = ((BTreeKeyValueDBTransaction)tr).BTreeRoot;
                 var cursor = newRoot!.CreateCursor();
@@ -1797,7 +1805,7 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
                 }
             }
 
-            Thread.Sleep(10);
+            await Task.Delay(TimeSpan.FromMilliseconds(100), cancellation).ConfigureAwait(false);
         }
     }
 
@@ -1806,12 +1814,15 @@ public class BTreeKeyValueDB : IHaveSubDB, IKeyValueDBInternal
         return GetGeneration(fileId);
     }
 
-    internal void MarkAsUnknown(IEnumerable<uint> fileIds)
+    internal bool MarkAsUnknown(IEnumerable<uint> fileIds)
     {
+        var anyTRL = false;
         foreach (var fileId in fileIds)
         {
-            MarkFileForRemoval(fileId);
+            anyTRL |= MarkFileForRemoval(fileId);
         }
+
+        return anyTRL;
     }
 
     internal long GetGeneration(uint fileId)

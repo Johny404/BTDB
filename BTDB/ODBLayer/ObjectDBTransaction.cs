@@ -1040,16 +1040,16 @@ class ObjectDBTransaction : IInternalObjectDBTransaction
     {
         var builder = RelationBuilder.GetFromCache(interfaceType, _owner.RelationInfoResolver);
         var relationInfo = _owner.RelationsInfo.CreateByName(this, relationName, interfaceType, builder);
-        var factory = (Func<IObjectDBTransaction, IRelation>)builder.DelegateCreator.Create(relationInfo);
+        var factory = (Func<IObjectDBTransaction, IRelation>)builder.DelegateCreator(relationInfo);
         if (relationInfo.LastPersistedVersion == 0)
         {
             var upgrader =
                 Owner.ActualOptions.Container?.ResolveOptional(
                     typeof(IRelationOnCreate<>).MakeGenericType(interfaceType));
             if (upgrader != null)
-                upgrader.GetType().GetMethod("OnCreate", BindingFlags.Instance | BindingFlags.Public,
-                        [typeof(IObjectDBTransaction), interfaceType])!
-                    .Invoke(upgrader, [this, factory(this)]);
+            {
+                ((IInternalRelationOnCreate)upgrader).InternalOnCreate(this, factory(this));
+            }
         }
 
         return factory;

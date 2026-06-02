@@ -28,6 +28,75 @@ public class RelationTests : GeneratorTestsBase
     }
 
     [Fact]
+    public Task VerifyRelationWithoutPrimaryKey()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            namespace TestNamespace;
+
+            public class Person
+            {
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IPersonTable : ICovariantRelation<Person>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyRelationAllocateId()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Person
+            {
+                [PrimaryKey] public ulong Id { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IPersonTable : IRelation<Person>
+            {
+                ulong AllocateId();
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyGenerateForClosedRelationInterfaceEmitsRelationItemMetadata()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB;
+            using BTDB.ODBLayer;
+
+            namespace TestNamespace;
+
+            public abstract class File
+            {
+                [PrimaryKey] public ulong Id { get; set; }
+                public string FileName { get; set; } = null!;
+            }
+
+            [GenerateFor(typeof(IFileTable<DownloadSectionFile>))]
+            public class DownloadSectionFile : File
+            {
+                public string UploadGuid { get; set; } = null!;
+            }
+
+            public interface IFileTable<TFile> : IRelation<TFile> where TFile : File
+            {
+                TFile FindByIdOrDefault(ulong id);
+            }
+            """);
+    }
+
+    [Fact]
     public Task VerifyRelationWithSecondaryKey()
     {
         // language=cs
@@ -39,7 +108,7 @@ public class RelationTests : GeneratorTestsBase
             public class Person
             {
                 [PrimaryKey(1)] public int ParentId { get; set; }
-                [PrimaryKey(2)] [SecondaryKey("PersonId", Order = 1) public int PersonId { get; set; }
+                [PrimaryKey(2)] [SecondaryKey("PersonId", Order = 1)] public int PersonId { get; set; }
                 [PrimaryKey(3, true)] public string Name { get; set; } = null!;
                 [SecondaryKey("LowerCaseName", IncludePrimaryKeyOrder = 1, Order = 2)] public string LowerCaseName => Name.ToLower();
                 [InKeyValue(4)] public string Description { get; set; } = null!;
@@ -47,6 +116,100 @@ public class RelationTests : GeneratorTestsBase
 
             public interface IPersonTable : IRelation<Person>
             {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task Repro_IndexOutOfRange_When_UpdateById_Missing_Pk_Parameter()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            #nullable enable
+            using BTDB.ODBLayer;
+
+            namespace Users;
+
+            public class User
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+                [PrimaryKey(2)] public ulong TenantId { get; set; }
+                public string Name { get; set; } = "";
+            }
+
+            public interface IUserTable : IRelation<User>
+            {
+                User? FindByIdOrDefault(ulong id, ulong tenantId);
+                void UpdateById(ulong id);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyNullableReferencePrimaryKeyUsesNullChecks()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            namespace TestNamespace;
+
+            public class Credentials
+            {
+                [PrimaryKey(1)] public ulong ConnectorId { get; set; }
+                [PrimaryKey(2)] public ulong CompanyId { get; set; }
+                [PrimaryKey(3)] public string? Domain { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface ICredentialsTable : IRelation<Credentials>
+            {
+                bool Contains(ulong connectorId, ulong companyId, string? domain);
+                Credentials? FindByIdOrDefault(ulong connectorId, ulong companyId, string? domain);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyFirstByWithNullableOrderersArray()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System;
+            using BTDB.ODBLayer;
+
+            public class Job
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong Id { get; set; }
+                [SecondaryKey("LastUpdate", IncludePrimaryKeyOrder = 1)] public DateTime LastUpdate { get; set; }
+            }
+
+            public interface IJobTable : IRelation<Job>
+            {
+                Job? FirstByLastUpdateOrDefault(Constraint<ulong> companyId, IOrderer[]? orderer);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyLastByWithNullableOrderersArray()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System;
+            using BTDB.ODBLayer;
+
+            public class Job
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong Id { get; set; }
+                [SecondaryKey("LastUpdate", IncludePrimaryKeyOrder = 1)] public DateTime LastUpdate { get; set; }
+            }
+
+            public interface IJobTable : IRelation<Job>
+            {
+                Job? LastByLastUpdateOrDefault(Constraint<ulong> companyId, IOrderer[]? orderer);
             }
             """);
     }
@@ -197,6 +360,7 @@ public class RelationTests : GeneratorTestsBase
         // language=cs
         return VerifySourceGenerator("""
             using System.Collections.Generic;
+            using BTDB.FieldHandler;
             using BTDB.ODBLayer;
 
             public class UserNotice
@@ -219,11 +383,122 @@ public class RelationTests : GeneratorTestsBase
     }
 
     [Fact]
+    public Task VerifyThatICollectionIsOk()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.FieldHandler;
+            using BTDB.ODBLayer;
+
+            public class UserNotice
+            {
+                [PrimaryKey(1)] public ulong UserId { get; set; }
+
+                [PrimaryKey(2)]
+                [SecondaryKey("NoticeId")]
+                public ulong NoticeId { get; set; }
+            }
+
+            [PersistedName("UserNotice")]
+            public interface IUserNoticeTable : IRelation<UserNotice>
+            {
+                void Insert(UserNotice un);
+                ICollection<UserNotice> ListByNoticeId(AdvancedEnumeratorParam<ulong> noticeId);
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task VerifyThatIReadOnlyCollectionIsOk()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.FieldHandler;
+            using BTDB.ODBLayer;
+
+            public class UserNotice
+            {
+                [PrimaryKey(1)] public ulong UserId { get; set; }
+
+                [PrimaryKey(2)]
+                [SecondaryKey("NoticeId")]
+                public ulong NoticeId { get; set; }
+            }
+
+            [PersistedName("UserNotice")]
+            public interface IUserNoticeTable : IRelation<UserNotice>
+            {
+                void Insert(UserNotice un);
+                IReadOnlyCollection<UserNotice> ListByNoticeId(AdvancedEnumeratorParam<ulong> noticeId);
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task VerifyThatIEnumerableIsOkWithCompatibleAdvancedEnumeratorParam()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.FieldHandler;
+            using BTDB.ODBLayer;
+
+            public class UserNotice
+            {
+                [PrimaryKey(1)] public ulong UserId { get; set; }
+
+                [PrimaryKey(2)]
+                [SecondaryKey("NoticeId")]
+                public ulong NoticeId { get; set; }
+            }
+
+            [PersistedName("UserNotice")]
+            public interface IUserNoticeTable : IRelation<UserNotice>
+            {
+                void Insert(UserNotice un);
+                IEnumerable<UserNotice> ListByNoticeId(AdvancedEnumeratorParam<uint> noticeId);
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task ReportErrorForSuperfluousMethodParameter()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.FieldHandler;
+            using BTDB.ODBLayer;
+
+            public class Person
+            {
+                [PrimaryKey(1)] public ulong TenantId { get; set; }
+                [PrimaryKey(2)] public ulong Id { get; set; }
+                [SecondaryKey("Name", IncludePrimaryKeyOrder = 1)] public string Name { get; set; } = null!;
+            }
+
+            public interface IPersonTableSuperfluousParameter : IRelation<Person>
+            {
+                void Insert(Person person);
+                // AdvancedEnumeratorParam targets implicit primary key field; use mismatched type to validate checks.
+                IEnumerable<Person> ListByName(ulong tenantId, string name, AdvancedEnumeratorParam<string> param);
+            }
+
+            """);
+    }
+
+    [Fact]
     public Task VerifyThatIEnumeratorIsError()
     {
         // language=cs
         return VerifySourceGenerator("""
             using System.Collections.Generic;
+            using BTDB.FieldHandler;
             using BTDB.ODBLayer;
 
             public class UserNotice
@@ -240,6 +515,235 @@ public class RelationTests : GeneratorTestsBase
             {
                 void Insert(UserNotice un);
                 IEnumerator<UserNotice> ListByNoticeId(AdvancedEnumeratorParam<ulong> noticeId);
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task ReportsProblemAboutUsageOfUnknownMethod()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Person
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+            }
+
+            public interface IWronglyDefinedUnknownMethod : IRelation<Person>
+            {
+                void Insert(Person person);
+                void Delete(Person person);
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task ListByMethodMustReturnEnumerable()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.FieldHandler;
+            using BTDB.ODBLayer;
+
+            public class UserNotice
+            {
+                [PrimaryKey(1)] public ulong UserId { get; set; }
+
+                [PrimaryKey(2)]
+                [SecondaryKey("NoticeId")]
+                public ulong NoticeId { get; set; }
+            }
+
+            [PersistedName("UserNotice")]
+            public interface IUserNoticeTable : IRelation<UserNotice>
+            {
+                void Insert(UserNotice un);
+                UserNotice ListByNoticeId(ulong noticeId);
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task ListByMethodReturningIListTriggersFailure()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class UserNotice
+            {
+                [PrimaryKey(1)] public ulong UserId { get; set; }
+                [PrimaryKey(2)] public ulong NoticeId { get; set; }
+            }
+
+            public interface IUserNoticeTable : IRelation<UserNotice>
+            {
+                IList<UserNotice> ListById(ulong userId);
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task ListByMethodWithAdvancedEnumeratorParamWrongType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.FieldHandler;
+            using BTDB.ODBLayer;
+
+            public class UserNotice
+            {
+                [PrimaryKey(1)] public ulong UserId { get; set; }
+
+                [PrimaryKey(2)]
+                [SecondaryKey("NoticeId")]
+                public ulong NoticeId { get; set; }
+            }
+
+            [PersistedName("UserNotice")]
+            public interface IUserNoticeTable : IRelation<UserNotice>
+            {
+                void Insert(UserNotice un);
+                IEnumerable<UserNotice> ListByNoticeId(AdvancedEnumeratorParam<int> noticeId);
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task ListByMethodAllowsAdvancedEnumeratorParamForImplicitPrimaryKeyField()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class SimpleObject
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+                [SecondaryKey("Name")] public string Name { get; set; } = null!;
+            }
+
+            public interface ISimpleRelation : IRelation<SimpleObject>
+            {
+                IEnumerable<SimpleObject> ListByName(string name, AdvancedEnumeratorParam<ulong> param);
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task ListByMethodWithAdvancedEnumeratorParamTooManyParameters()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.FieldHandler;
+            using BTDB.ODBLayer;
+
+            public class UserNotice
+            {
+                [PrimaryKey(1)] public ulong UserId { get; set; }
+
+                [PrimaryKey(2)]
+                [SecondaryKey("NoticeId")]
+                public ulong NoticeId { get; set; }
+            }
+
+            [PersistedName("UserNotice")]
+            public interface IUserNoticeTable : IRelation<UserNotice>
+            {
+                void Insert(UserNotice un);
+                IEnumerable<UserNotice> ListByNoticeId(ulong noticeId, ulong userId, AdvancedEnumeratorParam<ulong> noticeIdParam);
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task ListByMethodUsesExplicitSecondaryKeyPrefix()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class ContentVersion
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+
+                [PrimaryKey(2)] public ulong ContentId { get; set; }
+
+                [PrimaryKey(3)]
+                [SecondaryKey("State", Order = 4)]
+                public uint Version { get; set; }
+
+                [SecondaryKey("State", Order = 3, IncludePrimaryKeyOrder = 2)]
+                public ContentVersionState State { get; set; }
+            }
+
+            public enum ContentVersionState
+            {
+                Published = 0,
+                PreviouslyPublished = 1,
+            }
+
+            public interface IContentVersionTable : IRelation<ContentVersion>
+            {
+                IEnumerable<ContentVersion> ListByState(ulong companyId, ulong contentId, ContentVersionState state,
+                    AdvancedEnumeratorParam<uint> param);
+            }
+
+            """);
+    }
+
+    [Fact]
+    public Task ConstraintMethodsAllowImplicitPrimaryKeyFields()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class ThingWithSK
+            {
+                public ThingWithSK(ulong tenant, string name, uint age)
+                {
+                    Tenant = tenant;
+                    Name = name;
+                    Age = age;
+                }
+
+                [PrimaryKey(1)] public ulong Tenant { get; set; }
+
+                [PrimaryKey(2)]
+                [SecondaryKey("Name", IncludePrimaryKeyOrder = 0, Order = 1)]
+                public string Name { get; set; }
+
+                [SecondaryKey("Name", IncludePrimaryKeyOrder = 0, Order = 2)]
+                public uint Age { get; set; }
+            }
+
+            public interface IThingWithSKTable : IRelation<ThingWithSK>
+            {
+                IEnumerable<ThingWithSK> ScanByName(Constraint<string> name, Constraint<ulong> age,
+                    Constraint<ulong> tenant);
+
+                ulong GatherByName(List<ThingWithSK> target, long skip, long take, Constraint<string> name,
+                    Constraint<ulong> age, IOrderer[] orderers);
+
+                ThingWithSK? FirstByNameOrDefault(Constraint<string> name, Constraint<ulong> age, IOrderer[] orderers);
+
+                ThingWithSK FirstByName(Constraint<string> name, Constraint<ulong> age, IOrderer[] orderers);
             }
 
             """);
@@ -283,6 +787,10 @@ public class RelationTests : GeneratorTestsBase
             using System.Collections.Generic;
             using BTDB.ODBLayer;
 
+            public interface ICompanyRecord
+            {
+            }
+
             public class Item : ICompanyRecord
             {
                 [PrimaryKey(1)]
@@ -292,7 +800,7 @@ public class RelationTests : GeneratorTestsBase
                 public string Queue { get; set; }
 
                 [PrimaryKey(3)]
-                public Guid ItemId { get; set; }
+                public System.Guid ItemId { get; set; }
 
                 [SecondaryKey(nameof(LockDeadline), IncludePrimaryKeyOrder = 2, Order = 3)]
                 public int Priority { get; set; }
@@ -302,7 +810,7 @@ public class RelationTests : GeneratorTestsBase
                 /// after deadline work item is available to other worker.
                 /// </summary>
                 [SecondaryKey(nameof(LockDeadline), Order = 4)]
-                public DateTime LockDeadline { get; set; }
+                public System.DateTime LockDeadline { get; set; }
             }
 
 
@@ -310,6 +818,1733 @@ public class RelationTests : GeneratorTestsBase
             {
             }
 
+            """);
+    }
+
+    [Fact]
+    public Task VerifyItAutomaticallyGeneratesMetadataForMemberTypes()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class DeliveryRuleV1
+            {
+                public DeliveryRuleV1()
+                {
+                    Status = 100;
+                }
+
+                public IList<Activity> Activities { get; set; }
+
+                [PrimaryKey(1)] public ulong Id { get; set; }
+
+                public int Status { get; set; }
+            }
+
+            public interface IDeliveryRuleTable : IRelation<DeliveryRuleV1>
+            {
+                void Insert(DeliveryRuleV1 job);
+            }
+
+            public class Activity
+            {
+                public ulong Id { get; set; }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyVariantsAreRegistered()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+            using System.Collections.Generic;
+
+            public class Test
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+                public string Name { get; set; }
+                public int Age { get; set; }
+            }
+
+            public class JustAge
+            {
+                public int Age { get; set; }
+            }
+
+            public class JustName
+            {
+                public string Name { get; set; }
+            }
+
+            public interface IVariantTestTable : IRelation<Test>
+            {
+                JustAge FindById(ulong id);
+                ulong GatherById(ICollection<JustName> items, long skip, long take, Constraint<ulong> id);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task GatherBySecondaryKeyUsesSecondaryKeyIndex()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+            using System.Collections.Generic;
+
+            public class Person
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+                [SecondaryKey("Email")] public string Email { get; set; } = null!;
+            }
+
+            public interface IEmailTable : IRelation<Person>
+            {
+                ulong GatherByEmail(ICollection<Person> items, long skip, long take, Constraint<string> email);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task GatherByMethodAllowsCollectionImplementation()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class Item
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+            }
+
+            public interface IItemTable : IRelation<Item>
+            {
+                ulong GatherById(List<Item> items, long skip, long take, Constraint<ulong> id);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task ScanBySecondaryKeyUsesSecondaryKeyIndex()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Person
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+                [SecondaryKey("Email")] public string Email { get; set; } = null!;
+            }
+
+            public interface IEmailTable : IRelation<Person>
+            {
+                System.Collections.Generic.IEnumerable<Person> ScanByEmail(Constraint<string> email);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task ScanByPrimaryKeyUsesPrimaryKeyPrefix()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Person
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IPersonTable : IRelation<Person>
+            {
+                System.Collections.Generic.IEnumerable<Person> ScanById(Constraint<ulong> id);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task FirstByPrimaryKeyUsesPrimaryKeyIndex()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                Product FirstByIdOrDefault(Constraint<ulong> id);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyThatOnSerializeAttributeOnStaticMethodShowsError()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Test
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+
+                [OnSerialize]
+                public static void Serialize()
+                {
+                }
+            }
+
+            public interface ITestTable : IRelation<Test>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyThatOnSerializeAttributeOnNonVoidMethodShowsError()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Test
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+
+                [OnSerialize]
+                public int Serialize()
+                {
+                    return 42;
+                }
+            }
+
+            public interface ITestTable : IRelation<Test>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyThatOnSerializeAttributeOnMethodWithParametersShowsError()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Test
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+
+                [OnSerialize]
+                public void Serialize(int a)
+                {
+                }
+            }
+
+            public interface ITestTable : IRelation<Test>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyThatOnSerializeAttributeIsProperlyGenerated()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Test
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+
+                [OnSerialize]
+                public void MethodA()
+                {
+                }
+
+                [OnSerialize]
+                void MethodB()
+                {
+                }
+            }
+
+            public interface ITestTable : IRelation<Test>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyThatOnBeforeRemoveAttributeOnStaticMethodShowsError()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Test
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+
+                [OnBeforeRemove]
+                static public void MethodA()
+                {
+                }
+            }
+
+            public interface ITestTable : IRelation<Test>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyThatOnBeforeRemoveAttributeOnNonVoidOrBoolMethodShowsError()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Test
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+
+                [OnBeforeRemove]
+                public int MethodA()
+                {
+                    return 42;
+                }
+            }
+
+            public interface ITestTable : IRelation<Test>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyComplexOnBeforeRemove()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+            public interface I3rdPartyInterface { string Name { get; } }
+
+            public class Person
+            {
+                [PrimaryKey(1)] public string Name { get; set; }
+
+                [OnBeforeRemove]
+                public bool OnBeforeRemove()
+                {
+                    return true;
+                }
+
+                [OnBeforeRemove]
+                public bool SecondOnBeforeRemove(IObjectDBTransaction transaction)
+                {
+                    return true;
+                }
+
+                [OnBeforeRemove]
+                public bool ThirdOnBeforeRemove(I3rdPartyInterface dependency, I3rdPartyInterface? key1)
+                {
+                    return true;
+                }
+            }
+
+            public interface IPersonTable : IRelation<Person>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyComplexPrivateOnBeforeRemove()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+            public interface I3rdPartyInterface { string Name { get; } }
+
+            public class Person
+            {
+                [PrimaryKey(1)] public string Name { get; set; }
+
+                [OnBeforeRemove]
+                bool OnBeforeRemove()
+                {
+                    return true;
+                }
+
+                [OnBeforeRemove]
+                bool SecondOnBeforeRemove(IObjectDBTransaction transaction)
+                {
+                    return true;
+                }
+
+                [OnBeforeRemove]
+                void ThirdOnBeforeRemove(I3rdPartyInterface dependency, I3rdPartyInterface? key1)
+                {
+                }
+            }
+
+            public interface IPersonTable : IRelation<Person>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyInheritanceFromGenericInterface()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Person
+            {
+                [PrimaryKey(1)] public string Name { get; set; }
+            }
+
+            public interface IWithInsert<T>
+            {
+                void Insert(T user);
+            }
+
+            public interface IPersonTable : IWithInsert<Person>, IRelation<Person>
+            {
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyErrorIsShownForWrongNumberOfParameters()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Person
+            {
+                [PrimaryKey(1)] public string Name { get; set; }
+            }
+
+            public interface IPersonTable : IRelation<Person>
+            {
+                void Insert();
+            }
+            """);
+    }
+
+    [Fact]
+    public Task VerifyErrorIsShownForWrongReturnType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Person
+            {
+                [PrimaryKey(1)] public string Name { get; set; }
+            }
+
+            public interface IPersonTable : IRelation<Person>
+            {
+                int Insert(Person person);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task FindByMethodsChecksParameterTypes()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System;
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class ProductionTrackingDaily
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public DateTime ProductionDate { get; set; }
+            }
+
+            public interface IProductionInvalidTable : IRelation<ProductionTrackingDaily>
+            {
+                void Insert(ProductionTrackingDaily productionTrackingDaily);
+                IEnumerable<ProductionTrackingDaily> FindByProductionDateWithCompanyId(ulong companyId,
+                    AdvancedEnumeratorParam<DateTime> productionDate);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task FindByMethodChecksParameterCount()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System;
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                void Insert(Product product);
+                // FindById with missing parameter - should return single item but only has 1 of 2 params
+                Product FindById(ulong companyId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task FindByMethodMustReturnClassOrEnumerable()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                int FindById(ulong companyId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task FindByMethodMustReturnSerializableClass()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Threading.Tasks;
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                Task FindById(ulong companyId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task GatherByMethodMustReturnUlong()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // GatherById must return ulong, not int
+                int GatherById(ICollection<Product> items, long skip, long take);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task GatherByMethodMustHaveAtLeastThreeParameters()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // GatherById must have at least 3 parameters (collection, skip, take)
+                ulong GatherById(ICollection<Product> items);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task GatherByMethodFirstParameterMustBeICollection()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // First parameter must implement ICollection<>
+                ulong GatherById(IEnumerable<Product> items, long skip, long take);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task GatherByMethodSecondParameterMustBeNamedSkip()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // Second parameter must be named "skip" and be long
+                ulong GatherById(ICollection<Product> items, long wrongName, long take);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task GatherByMethodThirdParameterMustBeNamedTake()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // Third parameter must be named "take" and be long
+                ulong GatherById(ICollection<Product> items, long skip, long wrongName);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task FirstByMethodMustHaveClassReturnType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // FirstById must return class type, not struct
+                ulong FirstById(Constraint<ulong> companyId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task FirstByMethodWithTooManyConstraintParameters()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // FirstById has too many constraint parameters (3) for a 2-field primary key
+                Product FirstById(Constraint<ulong> companyId, Constraint<ulong> productId, Constraint<string> name);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task FirstByMethodWithConstraintParameterTypeMismatch()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // FirstById has wrong constraint type - should be Constraint<ulong> not Constraint<string>
+                Product FirstById(Constraint<string> companyId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task FirstByMethodWithConstraintParameterNameMismatch()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // FirstById has wrong parameter name - should be "companyId" not "wrongName"
+                Product FirstById(Constraint<ulong> wrongName);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task FirstByMethodWithNonConstraintParameter()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // FirstById parameter must be Constraint<T>, not raw type
+                Product FirstById(ulong companyId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task ContainsMethodMustReturnBool()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // Contains must return bool, not int
+                int Contains(ulong companyId, ulong productId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task ContainsMethodWithWrongParameterType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // Contains parameter type must match primary key type
+                bool Contains(string companyId, ulong productId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task ContainsMethodWithWrongParameterName()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // Contains parameter name must match primary key field name
+                bool Contains(ulong wrongName, ulong productId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task ContainsMethodWithMissingParameter()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // Contains must specify all primary key fields
+                bool Contains(ulong companyId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task FloatIndexIsRejected()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class FloatIndexEntity
+            {
+                [PrimaryKey(1)] public float Id { get; set; }
+            }
+
+            public interface IFloatIndexTable : IRelation<FloatIndexEntity>
+            {
+                bool Contains(float id);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task ContainsSupportsMoreKeyTypes()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System;
+            using System.Collections.Generic;
+            using System.Net;
+            using Microsoft.Extensions.Primitives;
+            using BTDB.ODBLayer;
+
+            public class ContainsKeyTypes
+            {
+                [PrimaryKey(1)] public string Name { get; set; } = "";
+                [PrimaryKey(2)] public TimeSpan Duration { get; set; }
+                [PrimaryKey(3)] public IPAddress Address { get; set; } = IPAddress.Loopback;
+                [PrimaryKey(4)] public Version ApiVersion { get; set; } = new Version(1, 0);
+                [PrimaryKey(5)] public StringValues Tags { get; set; } = StringValues.Empty;
+                [PrimaryKey(6)] public List<string> Names { get; set; } = new List<string>();
+                [PrimaryKey(7)] public List<ulong> Counters { get; set; } = new List<ulong>();
+            }
+
+            public interface IContainsKeyTypesTable : IRelation<ContainsKeyTypes>
+            {
+                bool Contains(string name, TimeSpan duration, IPAddress address, Version apiVersion,
+                    StringValues tags, List<string> names, List<ulong> counters);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task ContainsMethodGeneratesKeyLookup()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class ProductionTrackingDaily
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public global::System.DateTime ProductionDate { get; set; }
+            }
+
+            public interface IProductionTableWithContains : IRelation<ProductionTrackingDaily>
+            {
+                bool Contains(ulong companyId, global::System.DateTime productionDate);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task AnyByMethodMustReturnBool()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // AnyById must return bool, not int
+                int AnyById(ulong companyId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task AnyByMethodWithWrongParameterType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // AnyById parameter type must match primary key type
+                bool AnyById(string companyId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task AnyByMethodWithWrongParameterName()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // AnyById parameter name must match primary key field name
+                bool AnyById(ulong wrongName);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task AnyByMethodWithAdvancedEnumeratorParamWrongType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // AdvancedEnumeratorParam generic type must match last field type (ProductId is ulong, not int)
+                bool AnyById(ulong companyId, AdvancedEnumeratorParam<int> productIdParam);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task AnyByMethodWithAdvancedEnumeratorParamValid()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // Valid: AdvancedEnumeratorParam<ulong> matches ProductId type
+                bool AnyById(ulong companyId, AdvancedEnumeratorParam<ulong> productIdParam);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task CountByMethodMustReturnLongLikeType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // CountById must return int, uint, long, or ulong, not string
+                string CountById(ulong companyId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task CountByMethodWithWrongParameterType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // CountById parameter type must match primary key type
+                int CountById(string companyId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task CountByMethodWithWrongParameterName()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // CountById parameter name must match primary key field name
+                long CountById(ulong wrongName);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task CountByMethodWithAdvancedEnumeratorParamWrongType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // AdvancedEnumeratorParam generic type must match last field type (ProductId is ulong, not string)
+                long CountById(ulong companyId, AdvancedEnumeratorParam<string> productIdParam);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task CountByMethodWithAdvancedEnumeratorParamValid()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // Valid: AdvancedEnumeratorParam<ulong> matches ProductId type
+                long CountById(ulong companyId, AdvancedEnumeratorParam<ulong> productIdParam);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task RemoveByMethodMustReturnLongLikeType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // RemoveById must return int, uint, long, or ulong, not string
+                string RemoveById(ulong companyId, ulong productId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task RemoveByMethodWithWrongParameterType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // RemoveById parameter type must match primary key type
+                int RemoveById(string companyId, ulong productId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task RemoveByMethodWithWrongParameterName()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // RemoveById parameter name must match primary key field name
+                long RemoveById(ulong wrongName, ulong productId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task RemoveBySecondaryKeyIsUnsupported()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class ContactGroupRelation
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong GroupId { get; set; }
+
+                [PrimaryKey(3)]
+                [SecondaryKey("ContactId", IncludePrimaryKeyOrder = 1)]
+                public ulong ContactId { get; set; }
+            }
+
+            public interface IContactGroupRelationTable : IRelation<ContactGroupRelation>
+            {
+                int RemoveByContactId(ulong companyId, ulong contactId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task RemoveByMethodWithAdvancedEnumeratorParamWrongType()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // AdvancedEnumeratorParam generic type must match last field type (ProductId is ulong, not int)
+                int RemoveById(ulong companyId, AdvancedEnumeratorParam<int> productIdParam);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task RemoveByMethodWithAdvancedEnumeratorParamValid()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                // Valid: AdvancedEnumeratorParam<ulong> matches ProductId type
+                int RemoveById(ulong companyId, AdvancedEnumeratorParam<ulong> productIdParam);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task RemoveByMethodGeneratesRemoveById()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                void RemoveById(ulong companyId, ulong productId);
+                bool RemoveByIdOrDefault(ulong companyId, ulong productId);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task RemoveByIdPartialGeneratesPrefixPartial()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Product
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong ProductId { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IProductTable : IRelation<Product>
+            {
+                int RemoveByIdPartial(ulong companyId, int maxCount);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task RemoveByIdPrefixUsesFastRemove()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class DataSamePrefix
+            {
+                [PrimaryKey(1)]
+                [SecondaryKey("S", Order = 1)]
+                public int A { get; set; }
+
+                [PrimaryKey(2)] public int B { get; set; }
+
+                [PrimaryKey(3)]
+                [SecondaryKey("S", Order = 2)]
+                public int C { get; set; }
+            }
+
+            public interface IDataSamePrefixTable : IRelation<DataSamePrefix>
+            {
+                int RemoveById(int a);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task RemoveWithSizesByIdGeneratesPrimaryKeyConstraints()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Document
+            {
+                [PrimaryKey(1)] public ulong TenantId { get; set; }
+                [PrimaryKey(2)] public string Key { get; set; } = null!;
+                public string Value { get; set; } = null!;
+            }
+
+            public interface IDocumentTable : IRelation<Document>
+            {
+                (ulong Count, ulong KeySizes, ulong ValueSizes) RemoveWithSizesById(Constraint<ulong> tenantId,
+                    Constraint<string> key);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task UpdateMethodsGenerateBaseCalls()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Person
+            {
+                [PrimaryKey] public ulong Id { get; set; }
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IPersonTable : IRelation<Person>
+            {
+                void Update(Person person);
+                void ShallowUpdate(Person person);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task UpdateByIdGeneratesValueUpdates()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.Encrypted;
+            using BTDB.ODBLayer;
+
+            public class Person
+            {
+                [PrimaryKey(1)] public ulong TenantId { get; set; }
+                [PrimaryKey(2)] public ulong Id { get; set; }
+                public string Name { get; set; } = null!;
+                public EncryptedString Secret { get; set; }
+            }
+
+            public interface IPersonTable : IRelation<Person>
+            {
+                bool UpdateById(ulong tenantId, ulong id);
+                bool UpdateById(ulong tenantId, ulong id, string name);
+                void UpdateByIdSecret(ulong tenantId, ulong id, EncryptedString secret);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task UpdateByIdDetectsNotUniqueParameterNameMatch()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class PersonInvalid
+            {
+                [PrimaryKey(1)] public ulong TenantId { get; set; }
+
+                public string? Name { get; set; }
+
+                public string? ExpertSexChange { get; set; }
+                public string? ExpertsExchange { get; set; }
+            }
+
+            public interface IPersonInvalid3Table : IRelation<PersonInvalid>
+            {
+                bool UpdateById(ulong tenantId, string expertsExchange);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task UpdateByIdDetectsUnusedParameters()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class PersonInvalid
+            {
+                [PrimaryKey(1)] public ulong TenantId { get; set; }
+
+                public string? Name { get; set; }
+
+                public string? ExpertSexChange { get; set; }
+                public string? ExpertsExchange { get; set; }
+            }
+
+            public interface IPersonInvalid1Table : IRelation<PersonInvalid>
+            {
+                bool UpdateById(ulong tenantId, int age);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task UpdateByIdDetectsForbiddenValueTypes()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.ODBLayer;
+
+            public class PersonInvalid
+            {
+                [PrimaryKey(1)] public ulong TenantId { get; set; }
+
+                public IList<string> Names { get; set; } = new List<string>();
+                public IDictionary<int, string> Map { get; set; } = new Dictionary<int, string>();
+            }
+
+            public interface IPersonInvalid4Table : IRelation<PersonInvalid>
+            {
+                bool UpdateById(ulong tenantId, IList<string> names, IDictionary<int, string> map);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task RelationSupportsRoaringBitmapField()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class BitmapRow
+            {
+                [PrimaryKey(1)] public ulong Id { get; set; }
+
+                public IRoaringBitmap Bits { get; set; } = null!;
+            }
+
+            public interface IBitmapTable : IRelation<BitmapRow>
+            {
+                void Insert(BitmapRow row);
+                BitmapRow FindById(ulong id);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task UpdateByIdDetectsTypeMismatch()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class PersonInvalid
+            {
+                [PrimaryKey(1)] public ulong TenantId { get; set; }
+
+                public string Name { get; set; } = null!;
+            }
+
+            public interface IPersonInvalid2Table : IRelation<PersonInvalid>
+            {
+                bool UpdateById(ulong tenantId, int name);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task UpdateByIdDetectsEncryptedStringTypeMismatch()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.Encrypted;
+            using BTDB.ODBLayer;
+
+            public class PersonInvalid
+            {
+                [PrimaryKey(1)] public ulong TenantId { get; set; }
+
+                public EncryptedString Secret { get; set; }
+            }
+
+            public interface IPersonInvalid5Table : IRelation<PersonInvalid>
+            {
+                void UpdateByIdSecret(ulong tenantId, string secret);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task DefaultInterfaceMethodIsNotGenerated()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public class Item
+            {
+                [PrimaryKey] public ulong Id { get; set; }
+            }
+
+            public interface IItemTable : IRelation<Item>
+            {
+                int CountN1Groups() => 42;
+                void Update(Item item);
+            }
+            """);
+    }
+
+    [Fact]
+    public Task ClassRelationItemSupportsInterfaceContractHooks()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System.Collections.Generic;
+            using BTDB.IOC;
+            using BTDB.ODBLayer;
+
+            public interface IContract
+            {
+                [PrimaryKey(1)] ulong Id { get; set; }
+                string Name { get; set; }
+
+                [OnSerialize]
+                void Normalize();
+
+                [OnBeforeRemove]
+                bool CheckBeforeRemove(IObjectDBTransaction transaction, IContainer container);
+            }
+
+            public partial class Contract : IContract
+            {
+            }
+
+            public interface IContractTable : IRelation<Contract>
+            {
+                Contract FindById(ulong id);
+                IEnumerable<Contract> ListById();
+            }
+            """,
+            """
+            public partial class Contract
+            {
+                public virtual ulong Id { get; set; }
+                public virtual string Name { get; set; }
+
+                public virtual void Normalize()
+                {
+                }
+
+                public virtual bool CheckBeforeRemove(global::BTDB.ODBLayer.IObjectDBTransaction transaction,
+                    global::BTDB.IOC.IContainer container)
+                {
+                    return true;
+                }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task ClassRelationItemSupportsInheritedInterfaceContract()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using BTDB.ODBLayer;
+
+            public interface IBaseEntity
+            {
+                [PrimaryKey(1)] ulong TenantId { get; set; }
+
+                [OnSerialize]
+                void BaseSerialize();
+            }
+
+            public interface ILeftEntity : IBaseEntity
+            {
+            }
+
+            public interface IRightEntity : IBaseEntity
+            {
+            }
+
+            public interface IEntity : ILeftEntity, IRightEntity
+            {
+                string Name { get; set; }
+
+                [OnBeforeRemove]
+                void BeforeRemove();
+            }
+
+            public partial class Entity : IEntity
+            {
+            }
+
+            public interface IEntityTable : IRelation<Entity>
+            {
+                Entity FindById(ulong tenantId);
+            }
+            """,
+            """
+            public partial class Entity
+            {
+                public virtual ulong TenantId { get; set; }
+                public virtual string Name { get; set; }
+
+                public virtual void BaseSerialize()
+                {
+                }
+
+                public virtual void BeforeRemove()
+                {
+                }
+            }
+            """);
+    }
+
+    [Fact]
+    public Task Repro_InheritedRelationHooksOnGenericBaseGenerateInvalidConstraints()
+    {
+        // language=cs
+        return VerifySourceGenerator("""
+            using System;
+            using BTDB.ODBLayer;
+
+            namespace TestNamespace;
+
+            public interface ICompanyRecord
+            {
+                ulong CompanyId { get; }
+            }
+
+            public interface ICompanyItemTableBase<T> : IRelation<T> where T : class, ICompanyRecord
+            {
+            }
+
+            [BTDB.Generate]
+            public interface ICustomRelation : IRelation
+            {
+            }
+
+            public abstract class GenericProxy<TTable, TTableBase, TData>(IObjectDBTransaction tr)
+                where TTableBase : class, ICompanyItemTableBase<TData>
+                where TData : class, ICompanyRecord
+            {
+                public Type BtdbInternalGetRelationInterfaceType()
+                {
+                    return typeof(TTable);
+                }
+
+                public IRelation BtdbInternalNextInChain { get; set; } = null!;
+            }
+
+            public class Item : ICompanyRecord
+            {
+                [PrimaryKey(1)] public ulong CompanyId { get; set; }
+                [PrimaryKey(2)] public ulong Id { get; set; }
+            }
+
+            public interface IItemTableBase : ICompanyItemTableBase<Item>
+            {
+            }
+
+            public interface IItemTable : ICustomRelation
+            {
+            }
+
+            public class ItemTable(IObjectDBTransaction tr) : GenericProxy<IItemTable, IItemTableBase, Item>(tr), IItemTable
+            {
+            }
             """);
     }
 }

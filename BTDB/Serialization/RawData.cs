@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using BTDB.IL;
+using BTDB.KVDBLayer;
+using BTDB.ODBLayer;
 
 namespace BTDB.Serialization;
 
@@ -117,20 +119,54 @@ public sealed class RawData
         public byte Value;
     }
 
-    public static (uint Offset, uint Size) GetHashSetEntriesLayout(Type memberType)
+    public static (uint OffsetNext, uint Offset, uint Size) GetHashSetEntriesLayout(Type memberType)
     {
-        var sa = Combine((8, 4), GetSizeAndAlign(memberType));
-        return (Align(8, sa.Align), sa.Size);
+        if (!memberType.IsValueType)
+        {
+            return (12, 0, 16);
+        }
+
+        if (ReflectionMetadata.FindCollectionByElementType(memberType) is { } metadata)
+        {
+            return (metadata.OffsetNext, metadata.OffsetKey, metadata.SizeOfEntry);
+        }
+
+        throw new BTDBException("Cannot find metadata for Collection<" + memberType.ToSimpleName() + ">");
     }
 
-    public static (uint OffsetKey, uint OffsetValue, uint Size) GetDictionaryEntriesLayout(Type keyType, Type valueType)
+    public static (uint OffsetNext, uint OffsetKey, uint OffsetValue, uint Size) GetDictionaryEntriesLayout(
+        Type keyType, Type valueType)
     {
-        var saKey = GetSizeAndAlign(keyType);
-        var saValue = GetSizeAndAlign(valueType);
-        var sa = Combine((8, 4), saKey, saValue);
-        var offsetKey = Align(8, sa.Align);
-        var offsetValue = Align(offsetKey + saKey.Size, saValue.Align);
-        return (offsetKey, offsetValue, sa.Size);
+        if (!keyType.IsValueType && !valueType.IsValueType)
+        {
+            return (20, 0, 8, 24);
+        }
+
+        var type1 = typeof(Dictionary<,>).MakeGenericType(keyType, valueType);
+        if (ReflectionMetadata.FindCollectionByType(type1) is { } metadata)
+        {
+            return (metadata.OffsetNext, metadata.OffsetKey, metadata.OffsetValue, metadata.SizeOfEntry);
+        }
+
+        var type2 = typeof(IDictionary<,>).MakeGenericType(keyType, valueType);
+        if (ReflectionMetadata.FindCollectionByType(type2) is { } metadata2)
+        {
+            return (metadata2.OffsetNext, metadata2.OffsetKey, metadata2.OffsetValue, metadata2.SizeOfEntry);
+        }
+
+        var type3 = typeof(IOrderedDictionary<,>).MakeGenericType(keyType, valueType);
+        if (ReflectionMetadata.FindCollectionByType(type3) is { } metadata3)
+        {
+            return (metadata3.OffsetNext, metadata3.OffsetKey, metadata3.OffsetValue, metadata3.SizeOfEntry);
+        }
+
+        throw new BTDBException("Cannot find metadata for Dictionary<" + keyType.ToSimpleName() + ", " +
+                                valueType.ToSimpleName() + ">");
+    }
+
+    public static bool IsRefOrContainsRef(Type type)
+    {
+        return !type.IsValueType || MethodTableOf(type).ContainsGCPointers;
     }
 
     public static uint CombineAlign(uint align1, uint align2)
@@ -181,6 +217,11 @@ public sealed class RawData
             return Combine(GetSizeAndAlign(arguments[0]), GetSizeAndAlign(arguments[1]), GetSizeAndAlign(arguments[2]));
         }
 
+        if (type == typeof(decimal))
+        {
+            return (16, 8);
+        }
+
         if (type == typeof(long) || type == typeof(ulong) || type == typeof(double))
         {
             return (8, 8);
@@ -201,8 +242,36 @@ public sealed class RawData
             return (1, 1);
         }
 
-        var size = MethodTableOf(type).BaseSize;
-        return (size, size);
+        if (type == typeof(Guid))
+        {
+            return (16, 4);
+        }
+
+        // from type make Array<type> because it has always ComponentSize
+        var size = MethodTableOf(type.MakeArrayType()).ComponentSize;
+        var alignment = size;
+        if (alignment > 16) alignment = 16;
+        if (size == 16 && MethodTableOf(type).ContainsGCPointers)
+        {
+            alignment = 8;
+        }
+
+        return (size, alignment);
+    }
+
+    public static int GetArrayLength(ref byte array)
+    {
+        return Unsafe.As<byte, Array>(ref array).Length;
+    }
+
+    public static void BuildListOutOfArray(ref byte array, ref byte list, Type listType)
+    {
+        var res = new List<object>();
+        SetMethodTable(res, listType);
+        var length = GetArrayLength(ref array);
+        Unsafe.As<byte, object>(ref Ref(res, (uint)Unsafe.SizeOf<object>())) = Unsafe.As<byte, object>(ref array);
+        Unsafe.As<byte, int>(ref Ref(res, (uint)Unsafe.SizeOf<object>() * 2)) = length;
+        Unsafe.As<byte, object>(ref list) = res;
     }
 
     static (uint Size, uint Align) Combine((uint Size, uint Align) f1, (uint Size, uint Align) f2)
@@ -220,17 +289,69 @@ public sealed class RawData
 
     public static (uint Item1, uint Item2) GetOffsets(Type t1, Type t2)
     {
-        var sa1 = GetSizeAndAlign(t1);
-        var sa2 = GetSizeAndAlign(t2);
-        if (!t2.IsValueType && t1.IsValueType || sa2.Align > sa1.Align)
+        var offsets = GetOffsets([t1, t2]);
+        return (offsets[0], offsets[1]);
+    }
+
+    public static uint[] GetOffsets(params Type[] types)
+    {
+        var fields = new OffsetField[types.Length];
+        for (var i = 0; i < types.Length; i++)
         {
-            // T2, T1
-            return (Align(sa2.Size, sa1.Align), 0);
+            var sizeAndAlign = GetSizeAndAlign(types[i]);
+            fields[i] = new()
+            {
+                Index = i,
+                Size = sizeAndAlign.Size,
+                Align = sizeAndAlign.Align,
+                IsReference = !types[i].IsValueType
+            };
         }
-        else
+
+        Array.Sort(fields, static (a, b) =>
         {
-            // T1, T2
-            return (0, Align(sa1.Size, sa2.Align));
+            if (a.IsReference != b.IsReference) return a.IsReference ? -1 : 1;
+            var alignCompare = b.Align.CompareTo(a.Align);
+            if (alignCompare != 0) return alignCompare;
+            return a.Index.CompareTo(b.Index);
+        });
+
+        var offsets = new uint[types.Length];
+        var offset = 0u;
+        foreach (var field in fields)
+        {
+            offset = Align(offset, field.Align);
+            offsets[field.Index] = offset;
+            offset += field.Size;
         }
+
+        return offsets;
+    }
+
+    struct OffsetField
+    {
+        public int Index;
+        public uint Size;
+        public uint Align;
+        public bool IsReference;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void BulkMoveWithWriteBarrier(ref byte destination, ref byte source, nuint byteCount)
+    {
+        BufferBulkMoveWithWriteBarrier(null, ref destination, ref source, byteCount);
+    }
+
+    [UnsafeAccessor(UnsafeAccessorKind.StaticMethod, Name = "BulkMoveWithWriteBarrier")]
+    static extern void BufferBulkMoveWithWriteBarrier(
+        [UnsafeAccessorType("System.Buffer")] object? buffer,
+        ref byte destination,
+        ref byte source,
+        nuint byteCount);
+
+    public static bool FitsInInt128(Type type)
+    {
+        return !RawData.MethodTableOf(type).ContainsGCPointers &&
+               RawData.GetSizeAndAlign(type).Size <= 16;
     }
 }

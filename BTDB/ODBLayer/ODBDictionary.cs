@@ -6,28 +6,40 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using BTDB.Buffer;
 using BTDB.FieldHandler;
-using BTDB.IL;
 using BTDB.KVDBLayer;
 using BTDB.StreamLayer;
 
 namespace BTDB.ODBLayer;
 
-public delegate T ReaderFun<out T>(ref MemReader reader, IReaderCtx? ctx);
+public delegate void RefReaderFun(ref MemReader reader, IInternalObjectDBTransaction transaction, ref byte value);
 
-delegate void WriterFun<in T>(T value, ref MemWriter writer, IWriterCtx? ctx);
+public delegate void RefWriterFun(ref MemWriter writer, IInternalObjectDBTransaction transaction, ref byte value);
 
 delegate void FreeContentFun(IInternalObjectDBTransaction transaction, ref MemReader reader, IList<ulong> dictIds);
 
-public class ODBDictionary<TKey, TValue> : IOrderedDictionary<TKey, TValue>, IQuerySizeDictionary<TKey>, IAmLazyDBObject
+public delegate void IterateKeyValueFun(ref byte key, ref byte value);
+
+public interface IInternalODBDictionary
+{
+    ulong DictId { get; }
+
+    // Actually type is IDictionary<TKey, TValue>, but I need it non-generic
+    void Upsert(IDictionary? pairs);
+
+    int Count { get; }
+
+    void Iterate(IterateKeyValueFun iterateKeyValueFun);
+}
+
+public class ODBDictionary<TKey, TValue> : IOrderedDictionary<TKey, TValue>, IQuerySizeDictionary<TKey>,
+    IInternalODBDictionary, IAmLazyDBObject
 {
     readonly IInternalObjectDBTransaction _tr;
-    readonly IFieldHandler _keyHandler;
-    readonly IFieldHandler _valueHandler;
 
-    readonly ReaderFun<TKey> _keyReader;
-    readonly WriterFun<TKey> _keyWriter;
-    readonly ReaderFun<TValue> _valueReader;
-    readonly WriterFun<TValue> _valueWriter;
+    readonly RefReaderFun _keyReader;
+    readonly RefWriterFun _keyWriter;
+    readonly RefReaderFun _valueReader;
+    readonly RefWriterFun _valueWriter;
     readonly IKeyValueDBTransaction _keyValueTr;
     readonly ulong _id;
     readonly byte[] _prefix;
@@ -39,8 +51,6 @@ public class ODBDictionary<TKey, TValue> : IOrderedDictionary<TKey, TValue>, IQu
     public ODBDictionary(IInternalObjectDBTransaction tr, ODBDictionaryConfiguration config, ulong id)
     {
         _tr = tr;
-        _keyHandler = config.KeyHandler!;
-        _valueHandler = config.ValueHandler!;
         _id = id;
         var len = PackUnpack.LengthVUInt(id);
         var prefix = new byte[ObjectDB.AllDictionariesPrefixLen + len];
@@ -49,10 +59,10 @@ public class ODBDictionary<TKey, TValue> : IOrderedDictionary<TKey, TValue>, IQu
             ref Unsafe.AddByteOffset(ref MemoryMarshal.GetReference(prefix.AsSpan()),
                 ObjectDB.AllDictionariesPrefixLen), id, len);
         _prefix = prefix;
-        _keyReader = ((ReaderFun<TKey>)config.KeyReader)!;
-        _keyWriter = ((WriterFun<TKey>)config.KeyWriter)!;
-        _valueReader = ((ReaderFun<TValue>)config.ValueReader)!;
-        _valueWriter = ((WriterFun<TValue>)config.ValueWriter)!;
+        _keyReader = config.KeyReader!;
+        _keyWriter = config.KeyWriter!;
+        _valueReader = config.ValueReader!;
+        _valueWriter = config.ValueWriter!;
         _keyValueTr = _tr.KeyValueDBTransaction;
         _count = -1;
     }
@@ -77,54 +87,6 @@ public class ODBDictionary<TKey, TValue> : IOrderedDictionary<TKey, TValue>, IQu
         }
 
         writer.WriteVUInt64(goodDict._id);
-    }
-
-    public static void DoFreeContent(IReaderCtx ctx, ulong id, int cfgId)
-    {
-        var readerCtx = (DBReaderCtx)ctx;
-        var tr = readerCtx.GetTransaction();
-        var dict = new ODBDictionary<TKey, TValue>(tr!, ODBDictionaryConfiguration.Get(cfgId), id);
-        dict.FreeContent(ctx, cfgId);
-    }
-
-    [SkipLocalsInit]
-    unsafe void FreeContent(IReaderCtx readerCtx, int cfgId)
-    {
-        var config = ODBDictionaryConfiguration.Get(cfgId);
-        var ctx = (DBReaderWithFreeInfoCtx)readerCtx;
-
-        if (config.FreeContent == null)
-        {
-            var method = ILBuilder.Instance.NewMethod<FreeContentFun>($"IDictFinder_Cfg_{cfgId}");
-            var ilGenerator = method.Generator;
-
-            var readerLoc = ilGenerator.DeclareLocal(typeof(IReaderCtx));
-            ilGenerator
-                .Ldarg(0)
-                .Ldarg(2)
-                // ReSharper disable once ObjectCreationAsStatement
-                .Newobj(() => new DBReaderWithFreeInfoCtx(null, null))
-                .Stloc(readerLoc);
-
-            var readerOrCtx = _valueHandler.NeedsCtx() ? (Action<IILGen>?)(il => il.Ldloc(readerLoc)) : null;
-            _valueHandler.FreeContent(ilGenerator, il => il.Ldarg(1), readerOrCtx);
-            ilGenerator.Ret();
-            config.FreeContent = method.Create();
-        }
-
-        var findIDictAction = (FreeContentFun)config.FreeContent;
-
-        Span<byte> buffer = stackalloc byte[4096];
-        using var cursor = _keyValueTr.CreateCursor();
-        while (cursor.FindNextKey(_prefix))
-        {
-            var valueSpan = cursor.GetValueSpan(ref buffer);
-            fixed (void* _ = valueSpan)
-            {
-                var valueReader = MemReader.CreateFromPinnedSpan(valueSpan);
-                findIDictAction(ctx.GetTransaction()!, ref valueReader, ctx.DictIds);
-            }
-        }
     }
 
     IEnumerator IEnumerable.GetEnumerator()
@@ -194,6 +156,17 @@ public class ODBDictionary<TKey, TValue> : IOrderedDictionary<TKey, TValue>, IQu
         }
     }
 
+    public void Iterate(IterateKeyValueFun iterateKeyValueFun)
+    {
+        using var cursor = _keyValueTr.CreateCursor();
+        while (cursor.FindNextKey(_prefix))
+        {
+            var key = CurrentToKey(cursor);
+            var value = DeserializeValue(cursor);
+            iterateKeyValueFun(ref Unsafe.As<TKey, byte>(ref key), ref Unsafe.As<TValue, byte>(ref value));
+        }
+    }
+
     public bool IsReadOnly => false;
 
     [SkipLocalsInit]
@@ -207,17 +180,13 @@ public class ODBDictionary<TKey, TValue> : IOrderedDictionary<TKey, TValue>, IQu
     ReadOnlySpan<byte> KeyToByteArray(TKey key, ref MemWriter writer)
     {
         writer.WriteBlock(_prefix);
-        IWriterCtx ctx = null;
-        if (_keyHandler.NeedsCtx()) ctx = new DBWriterCtx(_tr);
-        _keyWriter(key, ref writer, ctx);
+        _keyWriter(ref writer, _tr, ref Unsafe.As<TKey, byte>(ref key));
         return writer.GetScopedSpanAndReset();
     }
 
     ReadOnlySpan<byte> ValueToByteArray(TValue value, ref MemWriter writer)
     {
-        IWriterCtx ctx = null;
-        if (_valueHandler.NeedsCtx()) ctx = new DBWriterCtx(_tr);
-        _valueWriter(value, ref writer, ctx);
+        _valueWriter(ref writer, _tr, ref Unsafe.As<TValue, byte>(ref value));
         return writer.GetScopedSpanAndReset();
     }
 
@@ -226,20 +195,21 @@ public class ODBDictionary<TKey, TValue> : IOrderedDictionary<TKey, TValue>, IQu
     {
         Span<byte> buffer = stackalloc byte[4096];
         var keySpan = cursor.GetKeySpan(ref buffer)[_prefix.Length..];
+        var result = default(TKey);
         fixed (byte* keyPtr = keySpan)
         {
             var reader = new MemReader(keyPtr, keySpan.Length);
-            IReaderCtx ctx = null;
-            if (_keyHandler.NeedsCtx()) ctx = new DBReaderCtx(_tr);
-            return _keyReader(ref reader, ctx);
+            _keyReader(ref reader, _tr, ref Unsafe.As<TKey, byte>(ref result));
         }
+
+        return result;
     }
 
     TValue ByteArrayToValue(ref MemReader reader)
     {
-        IReaderCtx ctx = null;
-        if (_valueHandler.NeedsCtx()) ctx = new DBReaderCtx(_tr);
-        return _valueReader(ref reader, ctx);
+        var result = default(TValue);
+        _valueReader(ref reader, _tr, ref Unsafe.As<TValue, byte>(ref result));
+        return result;
     }
 
     [SkipLocalsInit]
@@ -844,5 +814,26 @@ public class ODBDictionary<TKey, TValue> : IOrderedDictionary<TKey, TValue>, IQu
     public IOrderedDictionaryEnumerator<TKey, TValue> GetAdvancedEnumerator(AdvancedEnumeratorParam<TKey> param)
     {
         return new AdvancedEnumerator<TKey, TValue>(this, param);
+    }
+
+    public ulong DictId => _id;
+
+    public void Upsert(IDictionary? pairs)
+    {
+        if (pairs == null) return;
+        if (pairs is IDictionary<TKey, TValue> genericPairs)
+        {
+            foreach (var pair in genericPairs)
+            {
+                this[pair.Key] = pair.Value;
+            }
+        }
+        else
+        {
+            foreach (DictionaryEntry pair in pairs)
+            {
+                this[(TKey)pair.Key!] = (TValue)pair.Value!;
+            }
+        }
     }
 }

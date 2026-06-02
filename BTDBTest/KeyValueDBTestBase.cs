@@ -31,10 +31,10 @@ public abstract class KeyValueDBTestBase
     protected abstract IKeyValueDB NewKeyValueDB();
 
     [Fact]
-    public void EmptyWritingTransaction()
+    public async Task EmptyWritingTransaction()
     {
         using var db = NewKeyValueDB();
-        using var tr = db.StartWritingTransaction().Result;
+        using var tr = await db.StartWritingTransaction();
         tr.Commit();
     }
 
@@ -88,6 +88,24 @@ public abstract class KeyValueDBTestBase
         Assert.Throws<BTDBException>(() => db.Dispose());
         tr.Dispose();
         db.Dispose();
+    }
+
+    [Fact]
+    public void DisposingReadOnlyTransactionTwiceDoesNotBreakPooledCursorReuse()
+    {
+        using var db = NewKeyValueDB();
+        var tr1 = db.StartReadOnlyTransaction();
+        var cursor1 = tr1.CreateCursor();
+        cursor1.Dispose();
+        tr1.Dispose();
+
+        var tr2 = db.StartReadOnlyTransaction();
+        var cursor2 = tr2.CreateCursor();
+
+        tr1.Dispose();
+
+        cursor2.Dispose();
+        tr2.Dispose();
     }
 
     [Fact]
@@ -220,17 +238,17 @@ public abstract class KeyValueDBTestBase
     }
 
     [Fact]
-    public void TwoEmptyWriteTransactionsWithNestedWaiting()
+    public async Task TwoEmptyWriteTransactionsWithNestedWaiting()
     {
         using var db = NewKeyValueDB();
-        Task<IKeyValueDBTransaction> trOuter;
-        using (var tr = db.StartWritingTransaction().Result)
+        ValueTask<IKeyValueDBTransaction> trOuter;
+        using (var tr = await db.StartWritingTransaction())
         {
-            trOuter = db.StartWritingTransaction().AsTask();
+            trOuter = db.StartWritingTransaction();
             tr.Commit();
         }
 
-        using (var tr = trOuter.Result)
+        using (var tr = await trOuter)
         {
             tr.Commit();
         }
@@ -463,20 +481,32 @@ public abstract class KeyValueDBTestBase
     public void AdvancedFindPreviousAndNextKeyWorks()
     {
         using var db = NewKeyValueDB();
-        var key = new byte[2];
+        var key = new byte[3];
         const int keysCreated = 10000;
         using (var tr = db.StartTransaction())
         {
             using var cursor = tr.CreateCursor();
+            var order = new int[keysCreated];
             for (var i = 0; i < keysCreated; i++)
             {
-                key[0] = (byte)(i / 256);
-                key[1] = (byte)(i % 256);
+                order[i] = i;
+            }
+
+            var random = new Random(0);
+            random.Shuffle(order);
+
+            for (var i = 0; i < keysCreated; i++)
+            {
+                FillKeyByIndex(order[i]);
                 cursor.CreateKey(key);
+                var j = order.Take(i).Count(ii => ii < order[i]);
+                Assert.Equal(j, cursor.GetKeyIndex());
             }
 
             tr.Commit();
         }
+
+        FillKeyByIndex(keysCreated - 1);
 
         using (var tr = db.StartTransaction())
         {
@@ -500,6 +530,13 @@ public abstract class KeyValueDBTestBase
 
             Assert.False(cursor.FindNextKey(new()));
             Assert.Equal(-1, cursor.GetKeyIndex());
+        }
+
+        void FillKeyByIndex(int i)
+        {
+            key[0] = (byte)(i / 256 / 256);
+            key[1] = (byte)(i / 256 % 256);
+            key[2] = (byte)(i % 256);
         }
     }
 
@@ -859,29 +896,27 @@ public abstract class KeyValueDBTestBase
     }
 
     [Fact]
-    public void StartWritingTransactionWorks()
+    public async Task StartWritingTransactionWorks()
     {
         using var db = NewKeyValueDB();
-        var tr1 = db.StartWritingTransaction().Result;
-        var tr2Task = db.StartWritingTransaction();
-        var task = Task.Factory.StartNew(() =>
+        using var tr1 = await db.StartWritingTransaction();
+        var tr2Task = db.StartWritingTransaction().AsTask();
+        var task = Task.Run(async () =>
         {
-            var tr2 = tr2Task.Result;
-            {
-                using var cursor = tr2.CreateCursor();
-                Assert.True(cursor.FindExactKey(Key1));
-                cursor.CreateKey(Key2);
-            }
+            using var tr2 = await tr2Task;
+            using var cursor = tr2.CreateCursor();
+            Assert.True(cursor.FindExactKey(Key1));
+            cursor.CreateKey(Key2);
             tr2.Commit();
-            tr2.Dispose();
         });
         {
             using var cursor = tr1.CreateCursor();
             cursor.CreateKey(Key1);
         }
         tr1.Commit();
-        tr1.Dispose();
-        task.Wait(1000);
+        var completedTask = await Task.WhenAny(task, Task.Delay(1000));
+        Assert.Same(task, completedTask);
+        await task;
         using var tr = db.StartTransaction();
         using var cursor2 = tr.CreateCursor();
         Assert.True(cursor2.FindExactKey(Key1));

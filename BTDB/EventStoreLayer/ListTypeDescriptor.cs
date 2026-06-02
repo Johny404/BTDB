@@ -1,10 +1,14 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 using BTDB.FieldHandler;
 using BTDB.IL;
+using BTDB.KVDBLayer;
+using BTDB.Serialization;
 using BTDB.StreamLayer;
 
 namespace BTDB.EventStoreLayer;
@@ -48,7 +52,7 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
         Name = $"List<{_itemDescriptor.Name}>";
     }
 
-    public bool Equals(ITypeDescriptor other)
+    public bool Equals(ITypeDescriptor? other)
     {
         return Equals(other, null);
     }
@@ -83,10 +87,10 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
     {
         text.Append("List<");
         _itemDescriptor!.BuildHumanReadableFullName(text, stack, indent);
-        text.Append(">");
+        text.Append('>');
     }
 
-    public bool Equals(ITypeDescriptor other, Dictionary<ITypeDescriptor, ITypeDescriptor>? equalities)
+    public bool Equals(ITypeDescriptor? other, Dictionary<ITypeDescriptor, ITypeDescriptor>? equalities)
     {
         if (ReferenceEquals(this, other)) return true;
         if (other is not ListTypeDescriptor o) return false;
@@ -116,6 +120,379 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
     public bool AnyOpNeedsCtx()
     {
         return !_itemDescriptor!.StoredInline || _itemDescriptor.AnyOpNeedsCtx();
+    }
+
+    ref struct ListItemLoaderCtx
+    {
+        internal nint StoragePtr;
+        internal object Object;
+        internal Layer2Loader ItemLoader;
+        internal unsafe delegate*<object, ref byte, void> Adder;
+        internal ITypeBinaryDeserializerContext? Ctx;
+        internal ref MemReader Reader;
+    }
+
+    public unsafe Layer2Loader GenerateLoad(Type targetType, ITypeConverterFactory typeConverterFactory)
+    {
+        if (targetType == typeof(object))
+        {
+            var genericItemLoad = _itemDescriptor!.GenerateLoadEx(typeof(object), typeConverterFactory);
+            return (ref MemReader reader, ITypeBinaryDeserializerContext? ctx, ref byte value) =>
+            {
+                var count = reader.ReadVUInt32();
+                if (count == 0)
+                {
+                    Unsafe.As<byte, object?>(ref value) = null;
+                    return;
+                }
+
+                count--;
+                var obj = new ListWithDescriptor<object?>((int)count, this);
+                while (count-- != 0)
+                {
+                    object? item = null;
+                    genericItemLoad(ref reader, ctx,
+                        ref Unsafe.As<object?, byte>(ref item));
+                    obj.Add(item);
+                }
+
+                Unsafe.As<byte, object?>(ref value) = obj;
+            };
+        }
+
+        if (targetType.IsSZArray)
+        {
+            var itemType = targetType.GetElementType()!;
+            var arrayItemLoad = _itemDescriptor!.GenerateLoadEx(itemType, typeConverterFactory);
+            return (ref MemReader reader, ITypeBinaryDeserializerContext? ctx, ref byte value) =>
+            {
+                var count = reader.ReadVUInt32();
+                if (count == 0)
+                {
+                    Unsafe.As<byte, object?>(ref value) = null;
+                    return;
+                }
+
+                count--;
+                var obj = Array.CreateInstance(itemType, (int)count);
+                if (_typeSerializers.PreserveDescriptors)
+                    TypeSerializers.Object2DescriptorMap.Add(obj, this);
+                ref readonly var mt = ref RawData.MethodTableRef(obj);
+                var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                var offsetDelta = mt.ComponentSize;
+                for (var i = 0u; i != count; i++, offset += offsetDelta)
+                {
+                    arrayItemLoad(ref reader, ctx, ref RawData.Ref(obj, offset));
+                }
+
+                Unsafe.As<byte, object?>(ref value) = obj;
+            };
+        }
+
+        var collectionMetadata = ReflectionMetadata.FindCollectionByType(targetType!);
+        if (collectionMetadata == null)
+        {
+            var itemType = targetType.IsArray ? targetType.GetElementType()! : targetType.GenericTypeArguments[0];
+            var ienumerableType = typeof(IEnumerable<>).MakeGenericType(itemType);
+            collectionMetadata = ReflectionMetadata.FindCollectionByType(ienumerableType);
+            if (collectionMetadata == null)
+            {
+                var ilistType = typeof(IList<>).MakeGenericType(itemType);
+                collectionMetadata = ReflectionMetadata.FindCollectionByType(ilistType);
+                if (collectionMetadata == null)
+                {
+                    var listType = typeof(List<>).MakeGenericType(itemType);
+                    collectionMetadata = ReflectionMetadata.FindCollectionByType(listType);
+                    if (collectionMetadata == null)
+                    {
+                        var isetType = typeof(ISet<>).MakeGenericType(itemType);
+                        collectionMetadata = ReflectionMetadata.FindCollectionByType(isetType);
+                        if (collectionMetadata == null)
+                        {
+                            var hashsetType = typeof(HashSet<>).MakeGenericType(itemType);
+                            collectionMetadata = ReflectionMetadata.FindCollectionByType(hashsetType);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (collectionMetadata == null)
+            throw new BTDBException("Cannot find collection metadata for " + targetType.ToSimpleName());
+
+        var itemLoad = _itemDescriptor!.GenerateLoadEx(collectionMetadata.ElementKeyType, typeConverterFactory);
+        var itemStackAllocator = ReflectionMetadata.FindStackAllocatorByType(collectionMetadata.ElementKeyType);
+
+        return (ref MemReader reader, ITypeBinaryDeserializerContext? ctx, ref byte value) =>
+        {
+            var count = reader.ReadVUInt32();
+            if (count == 0)
+            {
+                Unsafe.As<byte, object?>(ref value) = null;
+                return;
+            }
+
+            count--;
+            var obj = collectionMetadata!.Creator(count);
+            if (_typeSerializers.PreserveDescriptors)
+                TypeSerializers.Object2DescriptorMap.Add(obj, this);
+            var loaderCtx = new ListItemLoaderCtx
+            {
+                Adder = collectionMetadata.Adder,
+                ItemLoader = itemLoad,
+                Object = obj,
+                Ctx = ctx,
+                Reader = ref reader,
+            };
+            for (var i = 0; i != count; i++)
+            {
+                itemStackAllocator(ref Unsafe.As<ListItemLoaderCtx, byte>(ref loaderCtx), ref loaderCtx.StoragePtr,
+                    &Nested);
+
+                static void Nested(ref byte value)
+                {
+                    ref var context = ref Unsafe.As<byte, ListItemLoaderCtx>(ref value);
+                    context.ItemLoader(ref context.Reader, context.Ctx,
+                        ref Unsafe.AsRef<byte>((void*)context.StoragePtr));
+                    context.Adder(context.Object, ref Unsafe.AsRef<byte>((void*)context.StoragePtr));
+                }
+            }
+
+            Unsafe.As<byte, object?>(ref value) = obj;
+        };
+    }
+
+    public void Skip(ref MemReader reader, ITypeBinaryDeserializerContext? ctx)
+    {
+        var count = reader.ReadVUInt32();
+        if (count == 0) return;
+        count--;
+        for (var i = 0u; i != count; i++)
+        {
+            _itemDescriptor!.SkipEx(ref reader, ctx);
+        }
+    }
+
+    public Layer2Saver GenerateSave(Type targetType, ITypeConverterFactory typeConverterFactory)
+    {
+        var itemType = targetType.IsSZArray ? targetType.GetElementType()! : targetType.GenericTypeArguments[0];
+        var hashSetType = typeof(HashSet<>).MakeGenericType(itemType);
+        var listType = typeof(List<>).MakeGenericType(itemType);
+        var arrayType = itemType.MakeArrayType();
+        var saveItem = _itemDescriptor!.GenerateSaveEx(itemType, typeConverterFactory);
+        var layout = RawData.GetHashSetEntriesLayout(itemType);
+        return (ref MemWriter writer, ITypeBinarySerializerContext? ctx, ref byte value) =>
+        {
+            var obj = Unsafe.As<byte, object>(ref value);
+            if (obj == null)
+            {
+                writer.WriteByteZero();
+                return;
+            }
+
+            while (true)
+            {
+                var objType = obj.GetType();
+                if (arrayType.IsAssignableFrom(objType))
+                {
+                    var count = (uint)RawData.GetArrayLength(ref value);
+                    writer.WriteVUInt32(count + 1);
+                    ref readonly var mt = ref RawData.MethodTableRef(obj);
+                    var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                    var offsetDelta = mt.ComponentSize;
+                    for (var i = 0; i < count; i++, offset += offsetDelta)
+                    {
+                        saveItem(ref writer, ctx, ref RawData.Ref(obj, offset));
+                    }
+
+                    return;
+                }
+
+                if (listType.IsAssignableFrom(objType))
+                {
+                    var count = (uint)Unsafe.As<ICollection>(obj).Count;
+                    writer.WriteVUInt32(count + 1);
+                    obj = RawData.ListItems(Unsafe.As<List<object>>(obj));
+                    ref readonly var mt = ref RawData.MethodTableRef(obj);
+                    var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                    var offsetDelta = mt.ComponentSize;
+                    for (var i = 0; i < count; i++, offset += offsetDelta)
+                    {
+                        saveItem(ref writer, ctx, ref RawData.Ref(obj, offset));
+                    }
+
+                    return;
+                }
+
+                if (hashSetType.IsAssignableFrom(objType))
+                {
+                    var countFieldOffset = RawData.Align(8 + 4 * (uint)Unsafe.SizeOf<nint>(), 8);
+                    var count = Unsafe.As<byte, uint>(ref RawData.Ref(obj, countFieldOffset));
+                    var freeCount = Unsafe.As<byte, uint>(ref RawData.Ref(obj, countFieldOffset + 8));
+                    writer.WriteVUInt32(count - freeCount + 1);
+                    if (count != 0)
+                    {
+                        obj = RawData.HashSetEntries(Unsafe.As<HashSet<object>>(obj));
+                        ref readonly var mt = ref RawData.MethodTableRef(obj);
+                        var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                        var offsetDelta = mt.ComponentSize;
+                        if (offsetDelta != layout.Size)
+                            throw new BTDBException("Invalid HashSet layout " + offsetDelta + " != " + layout.Size);
+                        for (var i = 0; i < count; i++, offset += offsetDelta)
+                        {
+                            if (Unsafe.As<byte, int>(ref RawData.Ref(obj, offset + layout.OffsetNext)) < -1)
+                            {
+                                continue;
+                            }
+
+                            saveItem(ref writer, ctx, ref RawData.Ref(obj, offset + layout.Offset));
+                        }
+                    }
+
+                    return;
+                }
+
+                if (objType.IsGenericType && objType.Name == "<>z__ReadOnlyArray`1" &&
+                    objType.GenericTypeArguments[0] == itemType)
+                {
+                    obj = RawData.ListItems(Unsafe.As<List<object>>(obj));
+                    var count = (uint)RawData.GetArrayLength(ref Unsafe.As<object, byte>(ref obj));
+                    writer.WriteVUInt32(count + 1);
+                    ref readonly var mt = ref RawData.MethodTableRef(obj);
+                    var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                    var offsetDelta = mt.ComponentSize;
+                    for (var i = 0; i < count; i++, offset += offsetDelta)
+                    {
+                        saveItem(ref writer, ctx, ref RawData.Ref(obj, offset));
+                    }
+
+                    return;
+                }
+
+                else if (IsCollectionWrapper(objType, itemType))
+                {
+                    obj = Unsafe.As<byte, object>(ref RawData.Ref(obj, (uint)Unsafe.SizeOf<object>()));
+                }
+                else
+                {
+                    throw new BTDBException("Cannot save type " + objType.ToSimpleName());
+                }
+            }
+        };
+    }
+
+    public Layer2NewDescriptor? GenerateNewDescriptor(Type targetType, ITypeConverterFactory typeConverterFactory,
+        bool forbidSerializationOfLazyDBObjects)
+    {
+        if (_itemDescriptor!.Sealed) return null;
+        var itemType = targetType.IsSZArray ? targetType.GetElementType()! : targetType.GenericTypeArguments[0];
+        var nestedNewDescriptor =
+            _itemDescriptor!.GenerateNewDescriptorEx(itemType, typeConverterFactory,
+                forbidSerializationOfLazyDBObjects);
+        if (nestedNewDescriptor == null) return null;
+        var arrayType = itemType.MakeArrayType();
+        var hashSetType = typeof(HashSet<>).MakeGenericType(itemType);
+        var listType = typeof(List<>).MakeGenericType(itemType);
+        var layout = RawData.GetHashSetEntriesLayout(itemType);
+        return (ctx, ref value) =>
+        {
+            var obj = Unsafe.As<byte, object?>(ref value);
+            if (obj == null)
+            {
+                return;
+            }
+
+            while (true)
+            {
+                var objType = obj.GetType();
+                if (arrayType.IsAssignableFrom(objType))
+                {
+                    var count = (uint)RawData.GetArrayLength(ref value);
+                    ref readonly var mt = ref RawData.MethodTableRef(obj);
+                    var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                    var offsetDelta = mt.ComponentSize;
+                    for (var i = 0; i < count; i++, offset += offsetDelta)
+                    {
+                        nestedNewDescriptor(ctx, ref RawData.Ref(obj, offset));
+                    }
+
+                    return;
+                }
+
+                if (listType.IsAssignableFrom(objType))
+                {
+                    var count = (uint)Unsafe.As<ICollection>(obj).Count;
+                    obj = RawData.ListItems(Unsafe.As<List<object>>(obj));
+                    ref readonly var mt = ref RawData.MethodTableRef(obj);
+                    var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                    var offsetDelta = mt.ComponentSize;
+                    for (var i = 0; i < count; i++, offset += offsetDelta)
+                    {
+                        nestedNewDescriptor(ctx, ref RawData.Ref(obj, offset));
+                    }
+
+                    return;
+                }
+
+                if (hashSetType.IsAssignableFrom(objType))
+                {
+                    var count = Unsafe.As<byte, uint>(ref RawData.Ref(obj,
+                        RawData.Align(8 + 4 * (uint)Unsafe.SizeOf<nint>(), 8)));
+                    if (count != 0)
+                    {
+                        obj = RawData.HashSetEntries(Unsafe.As<HashSet<object>>(obj));
+                        ref readonly var mt = ref RawData.MethodTableRef(obj);
+                        var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                        var offsetDelta = mt.ComponentSize;
+                        if (offsetDelta != layout.Size)
+                            throw new BTDBException("Invalid HashSet layout " + offsetDelta + " != " + layout.Size);
+                        for (var i = 0; i < count; i++, offset += offsetDelta)
+                        {
+                            if (Unsafe.As<byte, int>(ref RawData.Ref(obj, offset + layout.OffsetNext)) < -1)
+                            {
+                                continue;
+                            }
+
+                            nestedNewDescriptor(ctx, ref RawData.Ref(obj, offset + layout.Offset));
+                        }
+                    }
+
+                    return;
+                }
+
+                if (objType.IsGenericType && objType.Name == "<>z__ReadOnlyArray`1" &&
+                    objType.GenericTypeArguments[0] == itemType)
+                {
+                    obj = RawData.ListItems(Unsafe.As<List<object>>(obj));
+                    var count = (uint)RawData.GetArrayLength(ref Unsafe.As<object, byte>(ref obj));
+                    ref readonly var mt = ref RawData.MethodTableRef(obj);
+                    var offset = mt.BaseSize - (uint)Unsafe.SizeOf<nint>();
+                    var offsetDelta = mt.ComponentSize;
+                    for (var i = 0; i < count; i++, offset += offsetDelta)
+                    {
+                        nestedNewDescriptor(ctx, ref RawData.Ref(obj, offset));
+                    }
+
+                    return;
+                }
+
+                else if (IsCollectionWrapper(objType, itemType))
+                {
+                    obj = Unsafe.As<byte, object>(ref RawData.Ref(obj, (uint)Unsafe.SizeOf<object>()));
+                }
+                else
+                {
+                    throw new BTDBException("Cannot iterate new descriptors for type " + objType.ToSimpleName());
+                }
+            }
+        };
+    }
+
+    static bool IsCollectionWrapper(Type objType, Type itemType)
+    {
+        return objType.IsConstructedGenericType &&
+               objType.GetGenericTypeDefinition() == typeof(Collection<>) &&
+               objType.GenericTypeArguments[0] == itemType;
     }
 
     static Type GetInterface(Type type) => type.GetInterface("ICollection`1") ?? type;
@@ -160,8 +537,8 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
                 .Brfalse(loadFinished)
                 .Ldloc(localArray)
                 .Ldloc(localIndex);
-            _itemDescriptor.GenerateLoadEx(ilGenerator, pushReader, pushCtx,
-                il => il.Do(pushDescriptor).LdcI4(0).Callvirt(() => default(ITypeDescriptor).NestedType(0)), itemType,
+            _itemDescriptor!.GenerateLoadEx(ilGenerator, pushReader, pushCtx,
+                il => il.Do(pushDescriptor).LdcI4(0).Callvirt(() => default(ITypeDescriptor)!.NestedType(0)), itemType,
                 _convertGenerator);
             ilGenerator
                 .Stelem(itemType)
@@ -211,8 +588,8 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
                 .Sub()
                 .Stloc(localCount)
                 .Ldloc(localList);
-            _itemDescriptor.GenerateLoadEx(ilGenerator, pushReader, pushCtx,
-                il => il.Do(pushDescriptor).LdcI4(0).Callvirt(() => default(ITypeDescriptor).NestedType(0)), itemType,
+            _itemDescriptor!.GenerateLoadEx(ilGenerator, pushReader, pushCtx,
+                il => il.Do(pushDescriptor).LdcI4(0).Callvirt(() => default(ITypeDescriptor)!.NestedType(0)), itemType,
                 _convertGenerator);
             ilGenerator
                 .Callvirt(listType.GetInterface("ICollection`1")!.GetMethod("Add")!)
@@ -256,9 +633,8 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
             var typeAsICollection = isConcreteImplementation ? type : typeof(ICollection<>).MakeGenericType(itemType);
             var getEnumeratorMethod = isConcreteImplementation
                 ? typeAsICollection.GetMethods()
-                    .Single(
-                        m => m.Name == nameof(IEnumerable.GetEnumerator) && m.ReturnType.IsValueType &&
-                             m.GetParameters().Length == 0)
+                    .Single(m => m.Name == nameof(IEnumerable.GetEnumerator) && m.ReturnType.IsValueType &&
+                                 m.GetParameters().Length == 0)
                 : typeAsICollection.GetInterface("IEnumerable`1")!.GetMethod(nameof(IEnumerable.GetEnumerator));
             var typeAsIEnumerator = getEnumeratorMethod!.ReturnType;
             var currentGetter = typeAsIEnumerator.GetProperty(nameof(IEnumerator.Current))!.GetGetMethod();
@@ -282,7 +658,7 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
                     {
                         il
                             .Ldloc(localEnumerator)
-                            .Callvirt(() => default(IEnumerator).MoveNext());
+                            .Callvirt(() => default(IEnumerator)!.MoveNext());
                     }
                 })
                 .Brfalse(finish)
@@ -325,7 +701,7 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
                         il.Ldloc(localEnumerator);
                     }
                 })
-                .Callvirt(() => default(IDisposable).Dispose())
+                .Callvirt(() => default(IDisposable)!.Dispose())
                 .EndTry();
         }
     }
@@ -337,7 +713,7 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
 
     public void MapNestedTypes(Func<ITypeDescriptor, ITypeDescriptor> map)
     {
-        InitFromItemDescriptor(map(_itemDescriptor));
+        InitFromItemDescriptor(map(_itemDescriptor!));
     }
 
     public bool Sealed { get; private set; }
@@ -363,7 +739,7 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
         nestedDescriptorWriter(ref writer, _itemDescriptor!);
     }
 
-    public void GenerateSave(IILGen ilGenerator, Action<IILGen> pushWriter, Action<IILGen> pushCtx,
+    public void GenerateSave(IILGen ilGenerator, Action<IILGen> pushWriter, Action<IILGen>? pushCtx,
         Action<IILGen> pushValue, Type valueType)
     {
         var notnull = ilGenerator.DefineLabel();
@@ -385,7 +761,7 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
             .Mark(notnull)
             .Do(pushWriter)
             .Ldloc(localCollection)
-            .Callvirt(typeAsICollection!.GetProperty(nameof(ICollection.Count))!.GetGetMethod()!)
+            .Callvirt(typeAsICollection.GetProperty(nameof(ICollection.Count))!.GetGetMethod()!)
             .LdcI4(1)
             .Add()
             .Call(typeof(MemWriter).GetMethod(nameof(MemWriter.WriteVUInt32))!);
@@ -421,7 +797,7 @@ class ListTypeDescriptor : ITypeDescriptor, IPersistTypeDescriptor
                 .Finally()
                 .Ldloca(localEnumerator)
                 .Constrained(typeAsIEnumerator)
-                .Callvirt(() => default(IDisposable).Dispose())
+                .Callvirt(() => default(IDisposable)!.Dispose())
                 .EndTry()
                 .Br(completeFinish);
         }

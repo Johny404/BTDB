@@ -2,7 +2,6 @@
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 
 namespace BTDB.Collections;
@@ -362,7 +361,7 @@ public struct StructList<T> : IEnumerable<T>, IEquatable<StructList<T>>
     public void SetCount(uint count)
     {
         if (count <= _count) _count = count;
-        else RepeatAdd(default, count - _count);
+        else RepeatAdd(default!, count - _count);
     }
 
     public void AddRange(in ReadOnlySpan<T> range)
@@ -436,7 +435,7 @@ public struct StructList<T> : IEnumerable<T>, IEquatable<StructList<T>>
 
         _count = totalCount;
 
-        AsSpan(index + 1, (int)_count - (int)itemsToInsert - index).CopyTo(AsSpan((int)(index + itemsToInsert)));
+        AsSpan(index + 1, (int)_count - itemsToInsert - index).CopyTo(AsSpan(index + itemsToInsert));
         newItems.CopyTo(AsSpan(index));
     }
 
